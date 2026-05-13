@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: hrms-backend
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: MONGODB_URI
+        fromDatabase:
+          name: hrms-mongodb
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: CORS_ORIGIN
+        value: https://hrms-frontend-blush.vercel.app
+
+databases:
+  - name: hrms-mongodb
+    plan: free
+    databaseName: hrms

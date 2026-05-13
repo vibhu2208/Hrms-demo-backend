@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:7.0
+    container_name: hrms-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_DATABASE: hrms
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - hrms-network
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: hrms-backend
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      - NODE_ENV=production
+      - MONGODB_URI=mongodb://mongodb:27017/hrms
+    depends_on:
+      - mongodb
+    networks:
+      - hrms-network
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+
+
+volumes:
+  mongodb_data:
+
+networks:
+  hrms-network:
+    driver: bridge
