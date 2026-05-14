@@ -34,10 +34,20 @@ const LeaveAuditAction = Object.freeze({
   OVERRIDDEN: 'overridden'
 });
 
+/** How a leave balance row was applied (bulk targeting or manual delta). */
+const LeaveAllocationType = Object.freeze({
+  COMPANY_WIDE: 'company_wide',
+  /** `designation_wise` targets tenant User.role (hr, manager, employee); API key kept for compatibility */
+  DESIGNATION_WISE: 'designation_wise',
+  EMPLOYEE_SPECIFIC: 'employee_specific',
+  MANUAL_ADJUSTMENT: 'manual_adjustment'
+});
+
 module.exports = {
   LeaveResetCycle,
   LeaveGenderRestriction,
   LeaveRequestStatus,
   LeaveHalfDayPeriod,
-  LeaveAuditAction
+  LeaveAuditAction,
+  LeaveAllocationType
 };

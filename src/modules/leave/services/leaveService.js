@@ -1,9 +1,11 @@
 const mongoose = require('mongoose');
 const { getLeaveModels } = require('../models/leaveModels');
 const { calculateLeaveDuration, toDateOnly } = require('./leaveCalculator');
+const { holidayDateKeysForLeaveCalc, fetchHolidaysForRangeDocs } = require('./holidayRangeHelper');
 const { LeaveRequestStatus, LeaveAuditAction } = require('../types/leave.types');
 const { validateLeaveRequestPolicy } = require('./leavePolicy');
 const { createNotification } = require('../../../controllers/notificationController');
+const { syncLeaveRequestToTimesheets } = require('../../timesheet/services/leaveTimesheetSync');
 
 const DEFAULT_SLA_HOURS = Number(process.env.LEAVE_SLA_HOURS || 48);
 
@@ -33,7 +35,17 @@ async function getTenantEmployeeModel(connection) {
   return connection.models.Employee || connection.model('Employee', schema);
 }
 
+/**
+ * Leave types may set autoApproval for low-touch employee requests.
+ * HR, managers, and company admins must always go through the normal approval queue.
+ */
+function shouldAutoApproveThisRequest(leaveType, subjectUserRole) {
+  if (!leaveType?.autoApproval) return false;
+  return subjectUserRole === 'employee';
+}
+
 async function getEligibleManagers(connection, employeeId) {
+  const User = await getTenantUserModel(connection);
   const Project = await getProjectModel(connection);
   const ProjectAssignment = await getProjectAssignmentModel(connection);
   const employeeIdStr = String(employeeId);
@@ -68,32 +80,59 @@ async function getEligibleManagers(connection, employeeId) {
   ]);
 
   const projectIds = [...projectIdSet].map((id) => new mongoose.Types.ObjectId(id));
-  if (projectIds.length === 0) {
-    return [];
+  const managerIds = new Set();
+
+  if (projectIds.length > 0) {
+    const projects = await Project.find({ _id: { $in: projectIds } }).select('_id projectManager assignedManagers');
+
+    projects.forEach((p) => {
+      if (p.projectManager) managerIds.add(String(p.projectManager));
+      if (Array.isArray(p.assignedManagers)) {
+        p.assignedManagers.forEach((m) => managerIds.add(String(m)));
+      }
+    });
+
+    const assignments = await ProjectAssignment.find({
+      projectId: { $in: [...projectIds, ...projectIds.map((id) => String(id))] },
+      role: 'manager',
+      isActive: { $ne: false }
+    }).select('userId');
+
+    assignments.forEach((a) => {
+      if (a.userId) managerIds.add(String(a.userId));
+    });
   }
 
-  const projects = await Project.find({ _id: { $in: projectIds } }).select('_id projectManager assignedManagers');
-
-  const managerIds = new Set();
-  projects.forEach((p) => {
-    if (p.projectManager) managerIds.add(String(p.projectManager));
-    if (Array.isArray(p.assignedManagers)) {
-      p.assignedManagers.forEach((m) => managerIds.add(String(m)));
-    }
-  });
-
-  const assignments = await ProjectAssignment.find({
-    projectId: { $in: [...projectIds, ...projectIds.map((id) => String(id))] },
-    role: 'manager',
-    isActive: { $ne: false }
-  }).select('userId');
-
-  assignments.forEach((a) => {
-    if (a.userId) managerIds.add(String(a.userId));
-  });
-
   managerIds.delete(String(employeeId));
+
+  const empUser = await User.findById(employeeId).select('reportingManager').lean();
+  if (empUser?.reportingManager) {
+    const rmEmail = String(empUser.reportingManager).trim().toLowerCase();
+    if (rmEmail) {
+      const rmUser = await User.findOne({ email: rmEmail, isActive: { $ne: false } }).select('_id role').lean();
+      if (
+        rmUser &&
+        ['manager', 'company_admin', 'admin'].includes(rmUser.role) &&
+        String(rmUser._id) !== String(employeeId)
+      ) {
+        managerIds.add(String(rmUser._id));
+      }
+    }
+  }
+
   return [...managerIds].map((id) => new mongoose.Types.ObjectId(id));
+}
+
+/** True when TenantUser.reportingManager resolves to an active approver (manager / admin roles). */
+async function hasReportingManagerApprover(connection, employeeId) {
+  const User = await getTenantUserModel(connection);
+  const empUser = await User.findById(employeeId).select('reportingManager').lean();
+  if (!empUser?.reportingManager) return false;
+  const rmEmail = String(empUser.reportingManager).trim().toLowerCase();
+  if (!rmEmail) return false;
+  const rmUser = await User.findOne({ email: rmEmail, isActive: { $ne: false } }).select('_id role').lean();
+  if (!rmUser || String(rmUser._id) === String(employeeId)) return false;
+  return ['manager', 'company_admin', 'admin'].includes(rmUser.role);
 }
 
 async function hasAnyActiveProjectAssignment(connection, employeeId) {
@@ -140,8 +179,11 @@ async function submitLeaveRequest(connection, actor, input) {
   if (!leaveType || leaveType.isArchived) throw new Error('Leave type not available');
 
   const hasProjectMembership = await hasAnyActiveProjectAssignment(connection, employee._id);
-  if (!hasProjectMembership) {
-    throw new Error('You are not assigned to any active project. Contact Admin.');
+  const hasRmApprover = await hasReportingManagerApprover(connection, employee._id);
+  if (!hasProjectMembership && !hasRmApprover) {
+    throw new Error(
+      'You are not assigned to any active project and no valid reporting manager is configured. Contact Admin.'
+    );
   }
   const managers = employee.role === 'manager' ? [] : await getEligibleManagers(connection, employee._id);
 
@@ -149,7 +191,8 @@ async function submitLeaveRequest(connection, actor, input) {
   const toDate = toDateOnly(input.toDate);
   if (toDate < fromDate) throw new Error('Invalid date range');
 
-  const holidays = await Holiday.find({ date: { $gte: fromDate, $lte: toDate } }).select('date');
+  const holidayRows = await fetchHolidaysForRangeDocs(Holiday, fromDate, toDate);
+  const holidays = holidayDateKeysForLeaveCalc(holidayRows, fromDate, toDate);
   const employeeProfile = employee.employeeId
     ? await Employee.findById(employee.employeeId).select('gender status')
     : null;
@@ -158,7 +201,7 @@ async function submitLeaveRequest(connection, actor, input) {
     fromDate,
     toDate,
     halfDay: Boolean(input.halfDay),
-    holidays: holidays.map((h) => h.date),
+    holidays,
     countWeekends: leaveType.countWeekends,
     sandwichPolicyApplicable: leaveType.sandwichPolicyApplicable
   });
@@ -176,6 +219,8 @@ async function submitLeaveRequest(connection, actor, input) {
     today: toDateOnly(new Date())
   });
 
+  const autoApproveNow = shouldAutoApproveThisRequest(leaveType, employee.role);
+
   const year = fromDate.getUTCFullYear();
   let allocation = null;
   if (leaveType.isPaid) {
@@ -189,7 +234,7 @@ async function submitLeaveRequest(connection, actor, input) {
     const available = allocation.totalAllocated - allocation.used - allocation.pending;
     if (available < durationDays) throw new Error('Insufficient leave balance');
 
-    if (leaveType.autoApproval) {
+    if (autoApproveNow) {
       allocation.used = Number((allocation.used + durationDays).toFixed(2));
     } else {
       allocation.pending = Number((allocation.pending + durationDays).toFixed(2));
@@ -198,7 +243,7 @@ async function submitLeaveRequest(connection, actor, input) {
   }
 
   const escalationDeadlineAt = new Date(Date.now() + DEFAULT_SLA_HOURS * 60 * 60 * 1000);
-  const targetStatus = leaveType.autoApproval ? LeaveRequestStatus.APPROVED : LeaveRequestStatus.PENDING;
+  const targetStatus = autoApproveNow ? LeaveRequestStatus.APPROVED : LeaveRequestStatus.PENDING;
   const leaveRequest = await LeaveRequest.create({
     employeeId: employee._id,
     leaveTypeId: leaveType._id,
@@ -213,22 +258,22 @@ async function submitLeaveRequest(connection, actor, input) {
     reason: input.reason || '',
     attachmentUrl: input.attachmentUrl || null,
     escalatedToAdmin: false,
-    escalationDeadlineAt: leaveType.autoApproval ? null : escalationDeadlineAt,
-    actionedBy: leaveType.autoApproval ? actorId : null,
-    actionedAt: leaveType.autoApproval ? new Date() : null,
-    actionNote: leaveType.autoApproval ? 'Auto-approved based on leave policy' : null
+    escalationDeadlineAt: autoApproveNow ? null : escalationDeadlineAt,
+    actionedBy: autoApproveNow ? actorId : null,
+    actionedAt: autoApproveNow ? new Date() : null,
+    actionNote: autoApproveNow ? 'Auto-approved based on leave policy' : null
   });
 
   await writeAudit(connection, {
     leaveRequestId: leaveRequest._id,
     action: LeaveAuditAction.CREATED,
     performedBy: actorId,
-    note: leaveType.autoApproval ? 'Leave request auto-approved by policy' : 'Leave request submitted',
+    note: autoApproveNow ? 'Leave request auto-approved by policy' : 'Leave request submitted',
     previousStatus: '',
     newStatus: targetStatus
   });
 
-  if (leaveType.autoApproval) {
+  if (autoApproveNow) {
     await writeAudit(connection, {
       leaveRequestId: leaveRequest._id,
       action: LeaveAuditAction.APPROVED,
@@ -237,6 +282,7 @@ async function submitLeaveRequest(connection, actor, input) {
       previousStatus: LeaveRequestStatus.PENDING,
       newStatus: LeaveRequestStatus.APPROVED
     });
+    await syncLeaveRequestToTimesheets(connection, leaveRequest._id);
     return leaveRequest;
   }
 
@@ -368,6 +414,8 @@ async function actionLeaveRequest(connection, actor, requestId, decision, note) 
     newStatus
   });
 
+  await syncLeaveRequestToTimesheets(connection, updated._id);
+
   return updated;
 }
 
@@ -424,6 +472,8 @@ async function adminOverrideLeave(connection, actor, requestId, status, note) {
     previousStatus: prevStatus,
     newStatus: status
   });
+
+  await syncLeaveRequestToTimesheets(connection, request._id);
 }
 
 async function runLeaveEscalationJob(connection) {

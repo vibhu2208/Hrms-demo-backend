@@ -15,6 +15,7 @@ const bcrypt = require('bcryptjs');
 const { sendEmail } = require('./emailService');
 const mongoose = require('mongoose');
 const ContractWorkflowService = require('./contractWorkflowService');
+const { allocateEmployeeCode } = require('../utils/employeeCodeUtils');
 
 class EmployeeCreationService {
   /**
@@ -488,24 +489,8 @@ class EmployeeCreationService {
    * Generate unique employee code
    */
   async generateEmployeeCode(tenantConnection) {
-    // Use the same Employee model with correct schema
     const TenantEmployee = getTenantModel(tenantConnection, 'Employee', employeeSchema);
-
-    // Get count of existing employees
-    const employeeCount = await TenantEmployee.countDocuments();
-
-    // Generate code: EMP + 4-digit number
-    const codeNumber = (employeeCount + 1).toString().padStart(4, '0');
-    const employeeCode = `EMP${codeNumber}`;
-
-    // Check if code already exists
-    const existing = await TenantEmployee.findOne({ employeeCode });
-    if (existing) {
-      // If exists, use timestamp to make it unique
-      return `EMP${Date.now().toString().slice(-6)}`;
-    }
-
-    return employeeCode;
+    return allocateEmployeeCode(TenantEmployee, null);
   }
 
   /**

@@ -3,7 +3,8 @@ const {
   TimesheetOverallStatus,
   TimesheetEntryType,
   TimesheetEntrySource,
-  SliceStatus
+  SliceStatus,
+  AttendanceStatus
 } = require('../types/timesheet.types');
 
 const timesheetSchema = new mongoose.Schema(
@@ -32,7 +33,19 @@ const timesheetEntrySchema = new mongoose.Schema(
     entryDate: { type: Date, required: true, index: true },
     projectId: { type: mongoose.Schema.Types.ObjectId, ref: 'Project', default: null, index: true },
     taskDescription: { type: String, default: '' },
+    /** Logged / billable work time (same as workedHours for work rows) */
     hours: { type: Number, required: true, min: 0, max: 24 },
+    workedHours: { type: Number, default: null, min: 0, max: 24 },
+    payableHours: { type: Number, default: null, min: 0, max: 24 },
+    attendanceStatus: {
+      type: String,
+      enum: Object.values(AttendanceStatus),
+      default: AttendanceStatus.PRESENT
+    },
+    leaveTypeId: { type: mongoose.Schema.Types.ObjectId, ref: 'LeaveTypeV2', default: null, index: true },
+    leaveRequestId: { type: mongoose.Schema.Types.ObjectId, ref: 'LeaveRequestV2', default: null, index: true },
+    isPaidLeave: { type: Boolean, default: false },
+    remarks: { type: String, default: '' },
     entryType: { type: String, enum: Object.values(TimesheetEntryType), default: TimesheetEntryType.WORK },
     isBillable: { type: Boolean, default: true },
     filledBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
@@ -45,6 +58,34 @@ const timesheetEntrySchema = new mongoose.Schema(
   },
   { timestamps: true, collection: 'timesheet_entries' }
 );
+
+timesheetEntrySchema.pre('validate', function normalizeHours(next) {
+  const type = this.entryType || TimesheetEntryType.WORK;
+  if (type === TimesheetEntryType.WORK || type === TimesheetEntryType.TRAINING || type === TimesheetEntryType.INTERNAL) {
+    const w = Number(this.workedHours != null ? this.workedHours : this.hours ?? 0);
+    this.workedHours = w;
+    this.hours = w;
+    if (this.payableHours == null || Number.isNaN(this.payableHours)) {
+      this.payableHours = w;
+    } else {
+      this.payableHours = Number(this.payableHours);
+    }
+    this.attendanceStatus = AttendanceStatus.PRESENT;
+    this.isPaidLeave = false;
+  } else {
+    const worked = Number(this.workedHours != null ? this.workedHours : this.hours ?? 0);
+    this.workedHours = worked;
+    this.hours = worked;
+    const phRaw = this.payableHours;
+    if (phRaw === undefined || phRaw === null) {
+      this.payableHours = 0;
+    } else {
+      const n = Number(phRaw);
+      this.payableHours = Number.isFinite(n) ? Math.min(24, Math.max(0, n)) : 0;
+    }
+  }
+  next();
+});
 
 timesheetEntrySchema.index({ timesheetId: 1, entryDate: 1, projectId: 1 });
 

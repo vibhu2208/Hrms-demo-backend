@@ -4,7 +4,8 @@ const {
   LeaveGenderRestriction,
   LeaveRequestStatus,
   LeaveHalfDayPeriod,
-  LeaveAuditAction
+  LeaveAuditAction,
+  LeaveAllocationType
 } = require('../types/leave.types');
 
 const leaveTypeSchema = new mongoose.Schema(
@@ -48,7 +49,22 @@ const leaveAllocationSchema = new mongoose.Schema(
     used: { type: Number, default: 0, min: 0 },
     pending: { type: Number, default: 0, min: 0 },
     overrideNote: { type: String, default: null },
-    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }
+    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    allocationType: {
+      type: String,
+      enum: Object.values(LeaveAllocationType),
+      default: LeaveAllocationType.EMPLOYEE_SPECIFIC,
+      index: true
+    },
+    allocationBatchId: { type: mongoose.Schema.Types.ObjectId, default: null, index: true },
+    allocationTargeting: {
+      departmentIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Department' }],
+      /** @deprecated Generic job titles; use roles for HRMS role-based allocation */
+      designations: [{ type: String, trim: true }],
+      /** Tenant User.role targets for designation_wise allocation (hr, manager, employee) */
+      roles: [{ type: String, enum: ['employee', 'hr', 'manager'], trim: true }],
+      branches: [{ type: String, trim: true }]
+    }
   },
   { timestamps: true, collection: 'leave_allocations', toJSON: { virtuals: true }, toObject: { virtuals: true } }
 );
@@ -103,11 +119,20 @@ const leaveRequestAuditSchema = new mongoose.Schema(
   { timestamps: { createdAt: true, updatedAt: false }, collection: 'leave_request_audit_log' }
 );
 
+const HolidayType = ['national', 'regional', 'company', 'optional'];
+const HolidayStatus = ['active', 'inactive'];
+
 const holidaySchema = new mongoose.Schema(
   {
     name: { type: String, required: true, trim: true },
     date: { type: Date, required: true, index: true },
+    /** Employee-level optional observance (in addition to type) */
     isOptional: { type: Boolean, default: false },
+    /** National / regional / company-wide / optional category */
+    holidayType: { type: String, enum: HolidayType, default: 'company' },
+    /** Same calendar date every year (leave & timesheet expansion) */
+    isRecurringYearly: { type: Boolean, default: false },
+    status: { type: String, enum: HolidayStatus, default: 'active' },
     location: { type: String, default: null },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }
   },
@@ -115,6 +140,7 @@ const holidaySchema = new mongoose.Schema(
 );
 
 holidaySchema.index({ date: 1, location: 1 }, { unique: true });
+holidaySchema.index({ status: 1, date: 1 });
 
 function getLeaveModels(connection) {
   const LeaveType = connection.models.LeaveTypeV2 || connection.model('LeaveTypeV2', leaveTypeSchema);

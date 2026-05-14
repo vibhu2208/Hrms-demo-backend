@@ -7,6 +7,7 @@ const {
   withdrawLeave,
   managerLeaveQueue,
   managerActionLeave,
+  adminLeaveOverview,
   adminEscalationInbox,
   adminOverride
 } = require('../../modules/leave/controllers/leaveController');
@@ -20,6 +21,7 @@ router.post('/', applyLeave);
 router.patch('/:id/withdraw', withdrawLeave);
 router.get('/manager/queue', managerLeaveQueue);
 router.patch('/:id/action', managerActionLeave);
+router.get('/admin/overview', adminLeaveOverview);
 router.get('/admin/escalations', adminEscalationInbox);
 router.patch('/:id/override', adminOverride);
 

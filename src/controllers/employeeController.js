@@ -3,6 +3,7 @@ const TenantUserSchema = require('../models/tenant/TenantUser');
 const Department = require('../models/Department');
 const { getTenantModel } = require('../middlewares/tenantMiddleware');
 const ContractWorkflowService = require('../services/contractWorkflowService');
+const { allocateEmployeeCode } = require('../utils/employeeCodeUtils');
 
 // @desc    Get all employees
 // @route   GET /api/employees
@@ -266,9 +267,7 @@ exports.createEmployee = async (req, res) => {
     const TenantEmployee = getTenantModel(tenantConnection, 'Employee', TenantEmployeeSchema);
     const { logEmployeeCreated } = require('../services/hrActivityLogService');
 
-    // Generate employee code
-    const employeeCount = await TenantEmployee.countDocuments();
-    const employeeCode = `EMP${String(employeeCount + 1).padStart(4, '0')}`;
+    const employeeCode = await allocateEmployeeCode(TenantEmployee, req.body.employeeCode);
 
     // Prepare employee data - include all fields from request body
     const employeeData = {
@@ -362,7 +361,8 @@ exports.createEmployee = async (req, res) => {
     });
   } catch (error) {
     console.error('Error creating employee:', error);
-    res.status(500).json({
+    const status = error.statusCode && Number.isInteger(error.statusCode) ? error.statusCode : 500;
+    res.status(status).json({
       success: false,
       message: error.message
     });

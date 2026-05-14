@@ -22,6 +22,43 @@ async function getUserModel(connection) {
   return connection.models.User || connection.model('User', schema);
 }
 
+function startOfDay(d) {
+  const x = new Date(d);
+  x.setHours(0, 0, 0, 0);
+  return x;
+}
+
+function endOfDay(d) {
+  const x = new Date(d);
+  x.setHours(23, 59, 59, 999);
+  return x;
+}
+
+function ymdKey(d) {
+  const x = new Date(d);
+  const y = x.getFullYear();
+  const m = String(x.getMonth() + 1).padStart(2, '0');
+  const day = String(x.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function addLeaveDaysToCalendar(calendar, fromDate, toDate, rangeStart, rangeEnd, event) {
+  let cur = startOfDay(new Date(fromDate));
+  const last = startOfDay(new Date(toDate));
+  const rs = startOfDay(new Date(rangeStart));
+  const re = startOfDay(new Date(rangeEnd));
+  while (cur <= last) {
+    if (cur >= rs && cur <= re) {
+      const key = ymdKey(cur);
+      if (!calendar[key]) calendar[key] = [];
+      calendar[key].push(event);
+    }
+    const next = new Date(cur);
+    next.setDate(next.getDate() + 1);
+    cur = next;
+  }
+}
+
 exports.createLeaveType = async (req, res) => {
   try {
     if (!isAdmin(req.user.role)) return res.status(403).json({ success: false, message: 'Admin only' });
@@ -64,23 +101,73 @@ exports.bulkAllocateLeaves = async (req, res) => {
   try {
     if (!isAdmin(req.user.role)) return res.status(403).json({ success: false, message: 'Admin only' });
     const connection = ensureTenant(req);
-    const { LeaveAllocation } = getLeaveModels(connection);
-    const { employeeIds = [], leaveTypeId, year, days } = req.body;
-    const updates = await Promise.all(
-      employeeIds.map((employeeId) =>
-        LeaveAllocation.findOneAndUpdate(
-          { employeeId, leaveTypeId, year },
-          {
-            $setOnInsert: { createdBy: req.user._id },
-            $set: { totalAllocated: days }
-          },
-          { upsert: true, new: true }
-        )
-      )
-    );
-    res.json({ success: true, data: updates });
+    const { processLeaveAllocationRequest } = require('../services/leaveAllocationService');
+    const data = await processLeaveAllocationRequest(connection, req.user, req.body);
+    res.json({ success: true, data });
   } catch (error) {
     res.status(400).json({ success: false, message: error.message });
+  }
+};
+
+/** Dashboard-style counts for the leave allocation admin screen */
+exports.adminLeaveAllocationsSummary = async (req, res) => {
+  try {
+    if (!isAdmin(req.user.role)) return res.status(403).json({ success: false, message: 'Admin only' });
+    const connection = ensureTenant(req);
+    const { LeaveAllocation, LeaveType } = getLeaveModels(connection);
+    const User = await getUserModel(connection);
+    const y = req.query.year;
+    const year = y != null && y !== '' && !Number.isNaN(Number(y)) ? Number(y) : new Date().getFullYear();
+    const [totalAllocations, activeLeaveTypes, employeesCovered] = await Promise.all([
+      LeaveAllocation.countDocuments({ year }),
+      LeaveType.countDocuments({ isArchived: false }),
+      User.countDocuments({ isActive: true, role: { $in: ['employee', 'hr', 'manager'] } })
+    ]);
+    res.json({
+      success: true,
+      data: { totalAllocations, activeLeaveTypes, employeesCovered, year }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+exports.adminRecentAllocations = async (req, res) => {
+  try {
+    if (!isAdmin(req.user.role)) return res.status(403).json({ success: false, message: 'Admin only' });
+    const connection = ensureTenant(req);
+    const { LeaveAllocation } = getLeaveModels(connection);
+    const y = req.query.year;
+    const year = y != null && y !== '' && !Number.isNaN(Number(y)) ? Number(y) : new Date().getFullYear();
+    const limit = Math.min(Math.max(Number(req.query.limit) || 40, 1), 100);
+    const rows = await LeaveAllocation.find({ year })
+      .sort({ updatedAt: -1 })
+      .limit(limit)
+      .populate('leaveTypeId', 'name')
+      .populate('employeeId', 'firstName lastName email employeeCode')
+      .lean();
+
+    const fmt = (u) => {
+      if (!u) return '—';
+      const n = `${u.firstName || ''} ${u.lastName || ''}`.trim();
+      return n || u.email || u.employeeCode || '—';
+    };
+
+    const data = rows.map((r) => ({
+      _id: r._id,
+      employeeName: fmt(r.employeeId),
+      employeeCode: r.employeeId?.employeeCode || null,
+      leaveTypeName: r.leaveTypeId?.name || '—',
+      totalAllocated: r.totalAllocated,
+      used: r.used,
+      pending: r.pending,
+      allocationType: r.allocationType || 'employee_specific',
+      updatedAt: r.updatedAt
+    }));
+
+    res.json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
   }
 };
 
@@ -107,7 +194,12 @@ exports.createHoliday = async (req, res) => {
     if (!isAdmin(req.user.role)) return res.status(403).json({ success: false, message: 'Admin only' });
     const connection = ensureTenant(req);
     const { Holiday } = getLeaveModels(connection);
-    const holiday = await Holiday.create({ ...req.body, createdBy: req.user._id });
+    const allowed = ['name', 'date', 'isOptional', 'location', 'holidayType', 'isRecurringYearly', 'status'];
+    const body = {};
+    for (const k of allowed) {
+      if (req.body[k] !== undefined) body[k] = req.body[k];
+    }
+    const holiday = await Holiday.create({ ...body, createdBy: req.user._id });
     res.status(201).json({ success: true, data: holiday });
   } catch (error) {
     res.status(400).json({ success: false, message: error.message });
@@ -118,10 +210,43 @@ exports.listHolidays = async (req, res) => {
   try {
     const connection = ensureTenant(req);
     const { Holiday } = getLeaveModels(connection);
-    const data = await Holiday.find({}).sort({ date: 1 });
+    const { year, q } = req.query;
+    const clauses = [];
+    if (year && /^\d{4}$/.test(String(year))) {
+      const y = parseInt(year, 10);
+      const start = new Date(Date.UTC(y, 0, 1));
+      const end = new Date(Date.UTC(y, 11, 31, 23, 59, 59, 999));
+      clauses.push({
+        $or: [{ isRecurringYearly: true }, { date: { $gte: start, $lte: end } }]
+      });
+    }
+    if (q && String(q).trim()) {
+      const esc = String(q).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      clauses.push({ name: { $regex: esc, $options: 'i' } });
+    }
+    const filter = clauses.length ? { $and: clauses } : {};
+    const data = await Holiday.find(filter).sort({ date: 1 }).lean();
     res.json({ success: true, data });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+exports.updateHoliday = async (req, res) => {
+  try {
+    if (!isAdmin(req.user.role)) return res.status(403).json({ success: false, message: 'Admin only' });
+    const connection = ensureTenant(req);
+    const { Holiday } = getLeaveModels(connection);
+    const allowed = ['name', 'date', 'isOptional', 'location', 'holidayType', 'isRecurringYearly', 'status'];
+    const updates = {};
+    for (const k of allowed) {
+      if (req.body[k] !== undefined) updates[k] = req.body[k];
+    }
+    const doc = await Holiday.findByIdAndUpdate(req.params.id, { $set: updates }, { new: true, runValidators: true });
+    if (!doc) return res.status(404).json({ success: false, message: 'Holiday not found' });
+    res.json({ success: true, data: doc });
+  } catch (error) {
+    res.status(400).json({ success: false, message: error.message });
   }
 };
 
@@ -303,6 +428,195 @@ exports.managerActionLeave = async (req, res) => {
     res.json({ success: true, data });
   } catch (error) {
     res.status(400).json({ success: false, message: error.message });
+  }
+};
+
+exports.adminLeaveOverview = async (req, res) => {
+  try {
+    if (!isAdmin(req.user.role)) return res.status(403).json({ success: false, message: 'Admin only' });
+    const connection = ensureTenant(req);
+    const { LeaveRequest, LeaveType } = getLeaveModels(connection);
+    const User = await getUserModel(connection);
+
+    const { startDate: startQ, endDate: endQ } = req.query;
+    const now = new Date();
+    let rangeStart = startQ ? startOfDay(new Date(startQ)) : startOfDay(new Date(now.getFullYear(), now.getMonth(), 1));
+    let rangeEnd = endQ ? endOfDay(new Date(endQ)) : endOfDay(new Date(now.getFullYear(), now.getMonth() + 1, 0));
+    if (rangeStart > rangeEnd) {
+      const t = rangeStart;
+      rangeStart = rangeEnd;
+      rangeEnd = t;
+    }
+
+    const v2Rows = await LeaveRequest.find({
+      status: { $in: ['approved', 'pending'] },
+      fromDate: { $lte: rangeEnd },
+      toDate: { $gte: rangeStart }
+    })
+      .sort({ fromDate: 1 })
+      .lean();
+
+    const LegacyLeaveRequest =
+      connection.models.LegacyLeaveRequest ||
+      connection.model('LegacyLeaveRequest', new mongoose.Schema({}, { strict: false }), 'leaverequests');
+
+    const legacyRows = await LegacyLeaveRequest.find({
+      status: { $in: ['approved', 'pending'] },
+      $or: [
+        { startDate: { $lte: rangeEnd }, endDate: { $gte: rangeStart } },
+        { fromDate: { $lte: rangeEnd }, toDate: { $gte: rangeStart } }
+      ]
+    })
+      .limit(500)
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const userIdSet = new Set();
+    v2Rows.forEach((r) => {
+      if (r.appliedFor) userIdSet.add(String(r.appliedFor));
+    });
+    legacyRows.forEach((r) => {
+      const uid = r.employeeId || r.appliedFor || r.userId || r.requestedBy;
+      if (uid) userIdSet.add(String(uid));
+    });
+
+    const userIds = [...userIdSet]
+      .filter(Boolean)
+      .map((id) => (mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null))
+      .filter(Boolean);
+    const leaveTypeIds = [...new Set(v2Rows.map((r) => String(r.leaveTypeId || '')).filter(Boolean))]
+      .map((id) => (mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null))
+      .filter(Boolean);
+
+    const [users, leaveTypes] = await Promise.all([
+      userIds.length ? User.find({ _id: { $in: userIds } }).select('_id firstName lastName name email employeeCode department designation').lean() : [],
+      leaveTypeIds.length ? LeaveType.find({ _id: { $in: leaveTypeIds } }).select('_id name').lean() : []
+    ]);
+    const userMap = new Map(users.map((u) => [String(u._id), u]));
+    const leaveTypeMap = new Map(leaveTypes.map((lt) => [String(lt._id), lt.name]));
+
+    const fullName = (u) =>
+      u ? `${u.firstName || ''} ${u.lastName || ''}`.trim() || u.name || u.email || 'Unknown' : 'Unknown';
+
+    const todayStart = startOfDay(new Date());
+    const todayEnd = endOfDay(new Date());
+
+    const seen = new Set();
+    const leaves = [];
+
+    for (const row of v2Rows) {
+      const key = `v2:${String(row._id)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const u = userMap.get(String(row.appliedFor || ''));
+      leaves.push({
+        _id: row._id,
+        legacy: false,
+        employeeName: fullName(u),
+        employeeCode: u?.employeeCode || null,
+        department: u?.department || null,
+        designation: u?.designation || null,
+        leaveTypeName: leaveTypeMap.get(String(row.leaveTypeId || '')) || 'Leave',
+        fromDate: row.fromDate,
+        toDate: row.toDate,
+        durationDays: row.durationDays,
+        halfDay: row.halfDay,
+        status: row.status,
+        reason: row.reason || ''
+      });
+    }
+
+    for (const row of legacyRows) {
+      const key = `legacy:${String(row._id)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const from = row.startDate || row.fromDate;
+      const to = row.endDate || row.toDate;
+      if (!from || !to) continue;
+      const requesterId = row.employeeId || row.appliedFor || row.userId || row.requestedBy;
+      const u = userMap.get(String(requesterId || ''));
+      const leaveTypeName = row.leaveTypeName || row.leaveType || row.type || 'Leave';
+      const durationDays =
+        Number(row.numberOfDays || row.durationDays || row.days || 0) || undefined;
+      leaves.push({
+        _id: row._id,
+        legacy: true,
+        employeeName: row.employeeName || fullName(u),
+        employeeCode: u?.employeeCode || row.employeeCode || null,
+        department: u?.department || null,
+        designation: u?.designation || null,
+        leaveTypeName,
+        fromDate: from,
+        toDate: to,
+        durationDays,
+        status: row.status || 'pending',
+        reason: row.reason || ''
+      });
+    }
+
+    leaves.sort((a, b) => new Date(a.fromDate) - new Date(b.fromDate));
+
+    const [v2OnNow, v2Future, legacyOnNow, legacyFuture] = await Promise.all([
+      LeaveRequest.countDocuments({
+        status: 'approved',
+        fromDate: { $lte: todayEnd },
+        toDate: { $gte: todayStart }
+      }),
+      LeaveRequest.countDocuments({
+        status: 'approved',
+        fromDate: { $gt: todayEnd }
+      }),
+      LegacyLeaveRequest.countDocuments({
+        status: 'approved',
+        $or: [
+          { startDate: { $lte: todayEnd }, endDate: { $gte: todayStart } },
+          { fromDate: { $lte: todayEnd }, toDate: { $gte: todayStart } }
+        ]
+      }),
+      LegacyLeaveRequest.countDocuments({
+        status: 'approved',
+        $or: [{ startDate: { $gt: todayEnd } }, { fromDate: { $gt: todayEnd } }]
+      })
+    ]);
+
+    const onLeaveNow = v2OnNow + legacyOnNow;
+    const plannedApproved = v2Future + legacyFuture;
+    const pendingInRange = leaves.filter((L) => L.status === 'pending').length;
+
+    const calendar = {};
+    for (const L of leaves) {
+      const ev = {
+        id: L.legacy ? `legacy-${String(L._id)}` : String(L._id),
+        employeeName: L.employeeName,
+        employeeCode: L.employeeCode,
+        leaveType: L.leaveTypeName,
+        startDate: L.fromDate,
+        endDate: L.toDate,
+        numberOfDays: L.durationDays,
+        status: L.status,
+        reason: L.reason
+      };
+      addLeaveDaysToCalendar(calendar, L.fromDate, L.toDate, rangeStart, rangeEnd, ev);
+    }
+
+    const approvedInRange = leaves.filter((L) => L.status === 'approved').length;
+
+    res.json({
+      success: true,
+      data: {
+        range: { start: rangeStart, end: rangeEnd },
+        summary: {
+          onLeaveNow,
+          plannedApproved,
+          pendingInRange,
+          approvedInRange
+        },
+        leaves,
+        calendar
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
   }
 };
 

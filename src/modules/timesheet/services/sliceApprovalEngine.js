@@ -2,35 +2,63 @@ const mongoose = require('mongoose');
 const { getTimesheetModels } = require('../models/timesheetModels');
 const { getLeaveModels } = require('../../leave/models/leaveModels');
 const {
+  fetchHolidaysForRangeDocs,
+  buildHolidayDateKeySet,
+  expandActiveHolidayDocToKeysInRange,
+  isMandatoryAutofillHoliday
+} = require('../../leave/services/holidayRangeHelper');
+const {
   TimesheetOverallStatus,
   SliceStatus,
   TimesheetEntrySource,
-  TimesheetEntryType
+  TimesheetEntryType,
+  AttendanceStatus
 } = require('../types/timesheet.types');
-
-function startOfWeek(date = new Date()) {
-  const d = new Date(date);
-  const day = d.getDay();
-  const diff = d.getDate() - day + (day === 0 ? -6 : 1);
-  d.setDate(diff);
-  d.setHours(0, 0, 0, 0);
-  return d;
-}
-
-function endOfWeek(date = new Date()) {
-  const d = startOfWeek(date);
-  d.setDate(d.getDate() + 6);
-  d.setHours(23, 59, 59, 999);
-  return d;
-}
+const { LeaveRequestStatus } = require('../../leave/types/leave.types');
+const { startOfWeek, endOfWeek, ensureWeekTimesheet } = require('./timesheetPeriod');
+const { syncApprovedLeavesOverlappingWeek, STANDARD_SHIFT } = require('./leaveTimesheetSync');
 
 async function getProjectModel(connection) {
   const schema = require('../../../models/tenant/Project');
   return connection.models.Project || connection.model('Project', schema);
 }
 
+function workedHoursForDailyCap(e) {
+  const t = e.entryType || TimesheetEntryType.WORK;
+  if (t === TimesheetEntryType.WORK) return Number(e.workedHours ?? e.hours ?? 0);
+  return Number(e.workedHours ?? 0);
+}
+
+/** ISO `YYYY-MM-DD` keys for days covered by approved full-day leave (half-day leaves excluded). */
+async function fetchFullDayApprovedLeaveDateKeys(connection, employeeId, rangeStart, rangeEnd) {
+  const { LeaveRequest } = getLeaveModels(connection);
+  const empId = mongoose.Types.ObjectId.isValid(employeeId)
+    ? new mongoose.Types.ObjectId(String(employeeId))
+    : employeeId;
+  const approvedLeaves = await LeaveRequest.find({
+    appliedFor: empId,
+    status: LeaveRequestStatus.APPROVED,
+    halfDay: { $ne: true },
+    fromDate: { $lte: rangeEnd },
+    toDate: { $gte: rangeStart }
+  })
+    .select('fromDate toDate')
+    .lean();
+
+  const leaveDates = new Set();
+  approvedLeaves.forEach((lr) => {
+    const cur = new Date(lr.fromDate);
+    const end = new Date(lr.toDate);
+    while (cur <= end) {
+      leaveDates.add(cur.toISOString().slice(0, 10));
+      cur.setDate(cur.getDate() + 1);
+    }
+  });
+  return leaveDates;
+}
+
 async function validateSubmission(connection, timesheet, entries) {
-  const { LeaveRequest, Holiday } = getLeaveModels(connection);
+  const { Holiday } = getLeaveModels(connection);
   const dailyHours = new Map();
   const hardErrors = [];
   const warnings = [];
@@ -39,48 +67,36 @@ async function validateSubmission(connection, timesheet, entries) {
   if (timesheet.periodStart > startOfWeek(new Date())) hardErrors.push('Submitting for a future week is not allowed');
 
   for (const e of entries) {
-    if (e.hours < 0) hardErrors.push(`Negative hours not allowed for ${new Date(e.entryDate).toDateString()}`);
+    const wh = workedHoursForDailyCap(e);
+    if (wh < 0) hardErrors.push(`Negative worked hours not allowed for ${new Date(e.entryDate).toDateString()}`);
     const key = new Date(e.entryDate).toISOString().slice(0, 10);
-    const rowHours = Number(e.hours || 0);
-    dailyHours.set(key, (dailyHours.get(key) || 0) + rowHours);
-    // Project is required only for meaningful work rows
-    if (rowHours > 0 && !e.projectId && e.entryType === TimesheetEntryType.WORK) {
+    dailyHours.set(key, (dailyHours.get(key) || 0) + wh);
+    if (wh > 0 && !e.projectId && e.entryType === TimesheetEntryType.WORK) {
       hardErrors.push(`Project is required for work entry on ${key}`);
     }
   }
 
   for (const [day, total] of dailyHours.entries()) {
-    if (total > 24) hardErrors.push(`Daily hours exceed 24 on ${day}`);
-    if (total > 10) warnings.push(`Daily hours exceed 10 on ${day}`);
+    if (total > 24) hardErrors.push(`Daily worked hours exceed 24 on ${day}`);
+    if (total > 10) warnings.push(`Daily worked hours exceed 10 on ${day}`);
   }
 
-  const approvedLeaves = await LeaveRequest.find({
-    appliedFor: timesheet.employeeId,
-    status: 'approved',
-    fromDate: { $lte: timesheet.periodEnd },
-    toDate: { $gte: timesheet.periodStart }
-  }).select('fromDate toDate');
+  const leaveDates = await fetchFullDayApprovedLeaveDateKeys(
+    connection,
+    timesheet.employeeId,
+    timesheet.periodStart,
+    timesheet.periodEnd
+  );
 
-  const leaveDates = new Set();
-  approvedLeaves.forEach((lr) => {
-    const cur = new Date(lr.fromDate);
-    while (cur <= lr.toDate) {
-      leaveDates.add(cur.toISOString().slice(0, 10));
-      cur.setDate(cur.getDate() + 1);
-    }
-  });
-
-  const holidays = await Holiday.find({
-    date: { $gte: timesheet.periodStart, $lte: timesheet.periodEnd }
-  }).select('date');
-  const holidaySet = new Set(holidays.map((h) => new Date(h.date).toISOString().slice(0, 10)));
+  const holidayRows = await fetchHolidaysForRangeDocs(Holiday, timesheet.periodStart, timesheet.periodEnd);
+  const holidaySet = buildHolidayDateKeySet(holidayRows, timesheet.periodStart, timesheet.periodEnd);
 
   for (const e of entries) {
     const day = new Date(e.entryDate).toISOString().slice(0, 10);
-    if (leaveDates.has(day) && e.entryType === TimesheetEntryType.WORK) {
+    if (leaveDates.has(day) && e.entryType === TimesheetEntryType.WORK && workedHoursForDailyCap(e) > 0) {
       hardErrors.push(`You have approved leave on ${day}. Cancel leave first.`);
     }
-    if (holidaySet.has(day) && e.entryType === TimesheetEntryType.WORK) {
+    if (holidaySet.has(day) && e.entryType === TimesheetEntryType.WORK && workedHoursForDailyCap(e) > 0) {
       warnings.push(`Entry on holiday ${day} will be treated as overtime work`);
     }
   }
@@ -93,6 +109,21 @@ async function submitTimesheet(connection, actor, timesheetId) {
   const ts = await Timesheet.findById(timesheetId);
   if (!ts) throw new Error('Timesheet not found');
   if (ts.overallStatus === TimesheetOverallStatus.LOCKED) throw new Error('Timesheet period is locked');
+  if (ts.overallStatus === TimesheetOverallStatus.FULLY_APPROVED) {
+    throw new Error('This timesheet is already fully approved.');
+  }
+  if (ts.overallStatus === TimesheetOverallStatus.SUBMITTED) {
+    throw new Error('This timesheet is already submitted for approval.');
+  }
+  if (ts.overallStatus === TimesheetOverallStatus.PARTIALLY_APPROVED) {
+    const canResubmit = await TimesheetEntry.exists({
+      timesheetId: ts._id,
+      sliceStatus: { $in: [SliceStatus.DRAFT, SliceStatus.SENT_BACK] }
+    });
+    if (!canResubmit) {
+      throw new Error('Nothing to resubmit. Wait for your manager or update slices returned for correction.');
+    }
+  }
 
   const entries = await TimesheetEntry.find({ timesheetId: ts._id });
   const validation = await validateSubmission(connection, ts, entries);
@@ -108,7 +139,7 @@ async function submitTimesheet(connection, actor, timesheetId) {
 
   await TimesheetEntry.updateMany(
     { timesheetId: ts._id, sliceStatus: { $in: [SliceStatus.DRAFT, SliceStatus.SENT_BACK] } },
-    { $set: { sliceStatus: SliceStatus.SUBMITTED } }
+    { $set: { sliceStatus: SliceStatus.SUBMITTED, isEditable: false } }
   );
 
   return { timesheet: ts, warnings: validation.warnings };
@@ -133,7 +164,8 @@ async function approveProjectSlice(connection, actor, timesheetId, projectId, se
       sliceStatus: targetStatus,
       approvedBy: sendBackReason ? null : actor._id,
       approvedAt: sendBackReason ? null : new Date(),
-      sentBackReason: sendBackReason || null
+      sentBackReason: sendBackReason || null,
+      isEditable: Boolean(sendBackReason)
     }
   });
   if (!result.modifiedCount) {
@@ -164,79 +196,96 @@ async function lockTimesheet(connection, actor, timesheetId) {
   return ts;
 }
 
-async function ensureWeekTimesheet(connection, employeeId, weekDate = new Date()) {
-  const { Timesheet } = getTimesheetModels(connection);
-  const periodStart = startOfWeek(weekDate);
-  const periodEnd = endOfWeek(weekDate);
-  const timesheet =
-    (await Timesheet.findOne({ employeeId, periodStart })) ||
-    (await Timesheet.create({ employeeId, periodStart, periodEnd }));
-  return timesheet;
-}
-
 async function autofillLeaveAndHolidays(connection, employeeId, weekDate = new Date()) {
   const { TimesheetEntry } = getTimesheetModels(connection);
-  const { LeaveRequest, Holiday } = getLeaveModels(connection);
+  const { Holiday } = getLeaveModels(connection);
   const ts = await ensureWeekTimesheet(connection, employeeId, weekDate);
 
-  const approvedLeaves = await LeaveRequest.find({
-    appliedFor: employeeId,
-    status: 'approved',
-    fromDate: { $lte: ts.periodEnd },
-    toDate: { $gte: ts.periodStart }
-  }).select('fromDate toDate halfDay');
+  await TimesheetEntry.deleteMany({
+    timesheetId: ts._id,
+    source: TimesheetEntrySource.LEAVE_AUTOFILL,
+    $or: [{ leaveRequestId: { $exists: false } }, { leaveRequestId: null }]
+  });
 
-  for (const leave of approvedLeaves) {
-    const cur = new Date(leave.fromDate);
-    while (cur <= leave.toDate) {
-      if (cur >= ts.periodStart && cur <= ts.periodEnd) {
-        const existing = await TimesheetEntry.findOne({
+  await syncApprovedLeavesOverlappingWeek(connection, employeeId, ts.periodStart, ts.periodEnd);
+
+  const holidayRows = await fetchHolidaysForRangeDocs(Holiday, ts.periodStart, ts.periodEnd);
+  for (const holiday of holidayRows) {
+    if (!isMandatoryAutofillHoliday(holiday)) continue;
+    const dayKeys = expandActiveHolidayDocToKeysInRange(holiday, ts.periodStart, ts.periodEnd);
+    for (const dayKey of dayKeys) {
+      const holidayDate = new Date(`${dayKey}T12:00:00.000Z`);
+      const existing = await TimesheetEntry.findOne({
+        timesheetId: ts._id,
+        entryDate: holidayDate,
+        source: TimesheetEntrySource.HOLIDAY_AUTOFILL
+      });
+      if (!existing) {
+        await TimesheetEntry.create({
           timesheetId: ts._id,
-          entryDate: new Date(cur),
-          source: TimesheetEntrySource.LEAVE_AUTOFILL
+          entryDate: holidayDate,
+          projectId: null,
+          taskDescription: 'Auto-filled public holiday',
+          hours: 0,
+          workedHours: 0,
+          payableHours: STANDARD_SHIFT,
+          attendanceStatus: AttendanceStatus.HOLIDAY,
+          entryType: TimesheetEntryType.HOLIDAY,
+          isBillable: false,
+          filledBy: employeeId,
+          source: TimesheetEntrySource.HOLIDAY_AUTOFILL,
+          sliceStatus: SliceStatus.APPROVED,
+          isEditable: false
         });
-        if (!existing) {
-          await TimesheetEntry.create({
-            timesheetId: ts._id,
-            entryDate: new Date(cur),
-            projectId: null,
-            taskDescription: 'Auto-filled from approved leave',
-            hours: leave.halfDay ? 4 : 8,
-            entryType: TimesheetEntryType.LEAVE,
-            isBillable: false,
-            filledBy: employeeId,
-            source: TimesheetEntrySource.LEAVE_AUTOFILL,
-            sliceStatus: SliceStatus.APPROVED,
-            isEditable: false
-          });
-        }
       }
-      cur.setDate(cur.getDate() + 1);
     }
   }
 
-  const holidays = await Holiday.find({ date: { $gte: ts.periodStart, $lte: ts.periodEnd }, isOptional: false }).select('date');
-  for (const holiday of holidays) {
-    const existing = await TimesheetEntry.findOne({
+  const holidaySet = buildHolidayDateKeySet(holidayRows, ts.periodStart, ts.periodEnd);
+  for (let i = 0; i < 7; i += 1) {
+    const d = new Date(ts.periodStart);
+    d.setDate(d.getDate() + i);
+    d.setHours(12, 0, 0, 0);
+    const dow = d.getDay();
+    if (dow !== 0 && dow !== 6) continue;
+    const dayKey = d.toISOString().slice(0, 10);
+    if (holidaySet.has(dayKey)) continue;
+
+    const existingWo = await TimesheetEntry.findOne({
       timesheetId: ts._id,
-      entryDate: holiday.date,
-      source: TimesheetEntrySource.HOLIDAY_AUTOFILL
+      entryDate: d,
+      source: TimesheetEntrySource.WEEK_OFF_AUTOFILL
     });
-    if (!existing) {
-      await TimesheetEntry.create({
-        timesheetId: ts._id,
-        entryDate: holiday.date,
-        projectId: null,
-        taskDescription: 'Auto-filled public holiday',
-        hours: 8,
-        entryType: TimesheetEntryType.HOLIDAY,
-        isBillable: false,
-        filledBy: employeeId,
-        source: TimesheetEntrySource.HOLIDAY_AUTOFILL,
-        sliceStatus: SliceStatus.APPROVED,
-        isEditable: false
-      });
-    }
+    if (existingWo) continue;
+
+    const blocking = await TimesheetEntry.findOne({
+      timesheetId: ts._id,
+      entryDate: d,
+      $or: [
+        { entryType: TimesheetEntryType.WORK, workedHours: { $gt: 0 } },
+        { entryType: TimesheetEntryType.WORK, hours: { $gt: 0 } },
+        { entryType: TimesheetEntryType.LEAVE },
+        { entryType: TimesheetEntryType.HOLIDAY }
+      ]
+    });
+    if (blocking) continue;
+
+    await TimesheetEntry.create({
+      timesheetId: ts._id,
+      entryDate: d,
+      projectId: null,
+      taskDescription: 'Week off',
+      hours: 0,
+      workedHours: 0,
+      payableHours: 0,
+      attendanceStatus: AttendanceStatus.WEEK_OFF,
+      entryType: TimesheetEntryType.WEEK_OFF,
+      isBillable: false,
+      filledBy: employeeId,
+      source: TimesheetEntrySource.WEEK_OFF_AUTOFILL,
+      sliceStatus: SliceStatus.APPROVED,
+      isEditable: false
+    });
   }
 
   return ts;
@@ -250,5 +299,6 @@ module.exports = {
   approveProjectSlice,
   lockTimesheet,
   autofillLeaveAndHolidays,
-  getProjectModel
+  getProjectModel,
+  fetchFullDayApprovedLeaveDateKeys
 };

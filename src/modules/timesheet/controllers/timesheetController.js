@@ -6,10 +6,16 @@ const {
   approveProjectSlice,
   lockTimesheet,
   autofillLeaveAndHolidays,
-  startOfWeek
+  startOfWeek,
+  fetchFullDayApprovedLeaveDateKeys
 } = require('../services/sliceApprovalEngine');
 const { parseCsv, validateParsedRows } = require('../services/bulkUploadParser');
-const { TimesheetEntrySource } = require('../types/timesheet.types');
+const {
+  TimesheetEntrySource,
+  TimesheetEntryType,
+  TimesheetOverallStatus,
+  SliceStatus
+} = require('../types/timesheet.types');
 
 function ensureTenant(req) {
   if (!req.tenant?.connection) throw new Error('Tenant connection unavailable');
@@ -125,7 +131,7 @@ exports.getWeekTimesheet = async (req, res) => {
       ts = await ensureWeekTimesheet(connection, employeeId, week);
       await autofillLeaveAndHolidays(connection, employeeId, week);
     }
-    const entries = await TimesheetEntry.find({ timesheetId: ts._id }).sort({ entryDate: 1, createdAt: 1 });
+    const entries = await TimesheetEntry.find({ timesheetId: ts._id }).sort({ entryDate: 1, createdAt: 1 }).populate('leaveTypeId', 'name isPaid');
     res.json({ success: true, data: { timesheet: ts, entries } });
   } catch (error) {
     res.status(400).json({ success: false, message: error.message });
@@ -151,28 +157,75 @@ exports.upsertEntries = async (req, res) => {
     const { TimesheetEntry } = getTimesheetModels(connection);
     const rows = req.body.entries || [];
 
+    const overall = ts.overallStatus || TimesheetOverallStatus.DRAFT;
+    if (overall === TimesheetOverallStatus.LOCKED || overall === TimesheetOverallStatus.FULLY_APPROVED) {
+      throw new Error('This timesheet is finalized and cannot be edited.');
+    }
+    if (overall === TimesheetOverallStatus.SUBMITTED) {
+      throw new Error(
+        'This timesheet is submitted for approval. You can edit again only after a manager returns it for corrections.'
+      );
+    }
+    if (overall === TimesheetOverallStatus.PARTIALLY_APPROVED) {
+      const allowEdit = await TimesheetEntry.exists({
+        timesheetId: ts._id,
+        sliceStatus: { $in: [SliceStatus.DRAFT, SliceStatus.SENT_BACK] },
+        isEditable: { $ne: false }
+      });
+      if (!allowEdit) {
+        throw new Error(
+          'This timesheet cannot be edited until a manager returns a slice for corrections.'
+        );
+      }
+    }
+
+    const fullDayLeaveIsoDays = await fetchFullDayApprovedLeaveDateKeys(
+      connection,
+      employeeId,
+      ts.periodStart,
+      ts.periodEnd
+    );
+    for (const row of rows) {
+      const et = row.entryType || TimesheetEntryType.WORK;
+      if (et !== TimesheetEntryType.WORK) continue;
+      const wh = Number(row.workedHours != null ? row.workedHours : row.hours);
+      if (wh <= 0) continue;
+      const dayKey = new Date(row.entryDate).toISOString().slice(0, 10);
+      if (fullDayLeaveIsoDays.has(dayKey)) {
+        throw new Error(`Project time is not allowed on ${dayKey} (approved full-day leave).`);
+      }
+    }
+
     for (const row of rows) {
       if (row.id) {
         const existing = await TimesheetEntry.findById(row.id);
         if (!existing) continue;
         if (!existing.isEditable) continue;
+        const wh = Number(row.workedHours != null ? row.workedHours : row.hours);
+        const ph = Number(row.payableHours != null ? row.payableHours : wh);
         Object.assign(existing, {
           entryDate: row.entryDate,
           projectId: row.projectId || null,
           taskDescription: row.taskDescription || '',
-          hours: row.hours,
+          hours: wh,
+          workedHours: wh,
+          payableHours: ph,
           entryType: row.entryType || existing.entryType,
           isBillable: Boolean(row.isBillable),
           filledBy: req.user._id
         });
         await existing.save();
       } else {
+        const wh = Number(row.workedHours != null ? row.workedHours : row.hours);
+        const ph = Number(row.payableHours != null ? row.payableHours : wh);
         await TimesheetEntry.create({
           timesheetId: ts._id,
           entryDate: row.entryDate,
           projectId: row.projectId || null,
           taskDescription: row.taskDescription || '',
-          hours: row.hours,
+          hours: wh,
+          workedHours: wh,
+          payableHours: ph,
           entryType: row.entryType || 'work',
           isBillable: row.isBillable !== false,
           filledBy: req.user._id,
@@ -180,7 +233,9 @@ exports.upsertEntries = async (req, res) => {
         });
       }
     }
-    const entries = await TimesheetEntry.find({ timesheetId: ts._id }).sort({ entryDate: 1 });
+    const entries = await TimesheetEntry.find({ timesheetId: ts._id })
+      .sort({ entryDate: 1 })
+      .populate('leaveTypeId', 'name isPaid');
     res.json({ success: true, data: { timesheet: ts, entries } });
   } catch (error) {
     res.status(400).json({ success: false, message: error.message });
@@ -306,7 +361,10 @@ exports.getTimesheetDetail = async (req, res) => {
     }
     const user = await User.findById(timesheet.employeeId).select('firstName lastName email').lean();
     const employeeName = user ? `${user.firstName || ''} ${user.lastName || ''}`.trim() || user.email : 'Unknown User';
-    const entriesRaw = await TimesheetEntry.find({ timesheetId: timesheet._id }).sort({ entryDate: 1, createdAt: 1 }).lean();
+    const entriesRaw = await TimesheetEntry.find({ timesheetId: timesheet._id })
+      .sort({ entryDate: 1, createdAt: 1 })
+      .populate('leaveTypeId', 'name isPaid')
+      .lean();
     const projectIds = [...new Set(entriesRaw.map((e) => String(e.projectId || '')).filter(Boolean))];
     const projects = projectIds.length
       ? await Project.find({ _id: { $in: projectIds } }).select('_id name projectCode').lean()
@@ -314,8 +372,13 @@ exports.getTimesheetDetail = async (req, res) => {
     const projectMap = new Map(projects.map((p) => [String(p._id), p]));
     const entries = entriesRaw.map((entry) => {
       const project = projectMap.get(String(entry.projectId || ''));
+      const lt = entry.leaveTypeId;
+      const leaveTypeName = lt && typeof lt === 'object' && lt.name ? lt.name : null;
+      const leaveTypeIdFlat = lt && typeof lt === 'object' && lt._id ? lt._id : entry.leaveTypeId;
       return {
         ...entry,
+        leaveTypeId: leaveTypeIdFlat,
+        leaveTypeName,
         projectName: project?.name || project?.projectCode || null
       };
     });
@@ -485,9 +548,12 @@ exports.bulkUploadCommit = async (req, res) => {
           continue;
         }
         if (existing && req.body.overwriteExisting === true) {
+          const wh = Number(row.hours);
           await TimesheetEntry.findByIdAndUpdate(existing._id, {
             $set: {
-              hours: row.hours,
+              hours: wh,
+              workedHours: wh,
+              payableHours: wh,
               taskDescription: row.taskDescription,
               isBillable: row.isBillable,
               entryType: row.entryType,
@@ -496,12 +562,15 @@ exports.bulkUploadCommit = async (req, res) => {
             }
           });
         } else {
+          const wh = Number(row.hours);
           await TimesheetEntry.create({
             timesheetId: ts._id,
             entryDate: new Date(row.entryDate),
             projectId: new mongoose.Types.ObjectId(row.projectId),
             taskDescription: row.taskDescription,
-            hours: row.hours,
+            hours: wh,
+            workedHours: wh,
+            payableHours: wh,
             entryType: row.entryType,
             isBillable: row.isBillable,
             filledBy: req.user._id,
