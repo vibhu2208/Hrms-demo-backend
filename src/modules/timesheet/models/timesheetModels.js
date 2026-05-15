@@ -120,6 +120,10 @@ const bulkUploadJobSchema = new mongoose.Schema(
 );
 
 function getTimesheetModels(connection) {
+  // TimesheetEntry refs LeaveTypeV2 / LeaveRequestV2 — register leave models before any populate().
+  const { getLeaveModels } = require('../../leave/models/leaveModels');
+  getLeaveModels(connection);
+
   const Timesheet = connection.models.TimesheetV2 || connection.model('TimesheetV2', timesheetSchema);
   const TimesheetEntry = connection.models.TimesheetEntryV2 || connection.model('TimesheetEntryV2', timesheetEntrySchema);
   const TimesheetAudit = connection.models.TimesheetAuditV2 || connection.model('TimesheetAuditV2', timesheetAuditSchema);

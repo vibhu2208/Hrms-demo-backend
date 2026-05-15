@@ -16,7 +16,12 @@ const {
 } = require('../types/timesheet.types');
 const { LeaveRequestStatus } = require('../../leave/types/leave.types');
 const { startOfWeek, endOfWeek, ensureWeekTimesheet } = require('./timesheetPeriod');
-const { syncApprovedLeavesOverlappingWeek, STANDARD_SHIFT } = require('./leaveTimesheetSync');
+const {
+  syncApprovedLeavesOverlappingWeek,
+  pruneEntriesOutsideTimesheetWeek,
+  STANDARD_SHIFT
+} = require('./leaveTimesheetSync');
+const { calendarDayKeyUtc, eachUtcDayKeyInRange, parseCalendarDate } = require('./timesheetPeriod');
 
 async function getProjectModel(connection) {
   const schema = require('../../../models/tenant/Project');
@@ -47,12 +52,11 @@ async function fetchFullDayApprovedLeaveDateKeys(connection, employeeId, rangeSt
 
   const leaveDates = new Set();
   approvedLeaves.forEach((lr) => {
-    const cur = new Date(lr.fromDate);
-    const end = new Date(lr.toDate);
-    while (cur <= end) {
-      leaveDates.add(cur.toISOString().slice(0, 10));
-      cur.setDate(cur.getDate() + 1);
-    }
+    eachUtcDayKeyInRange(lr.fromDate, lr.toDate, (dayKey) => {
+      if (dayKey >= calendarDayKeyUtc(rangeStart) && dayKey <= calendarDayKeyUtc(rangeEnd)) {
+        leaveDates.add(dayKey);
+      }
+    });
   });
   return leaveDates;
 }
@@ -208,6 +212,7 @@ async function autofillLeaveAndHolidays(connection, employeeId, weekDate = new D
   });
 
   await syncApprovedLeavesOverlappingWeek(connection, employeeId, ts.periodStart, ts.periodEnd);
+  await pruneEntriesOutsideTimesheetWeek(connection, ts._id, ts.periodStart, ts.periodEnd);
 
   const holidayRows = await fetchHolidaysForRangeDocs(Holiday, ts.periodStart, ts.periodEnd);
   for (const holiday of holidayRows) {
@@ -242,13 +247,13 @@ async function autofillLeaveAndHolidays(connection, employeeId, weekDate = new D
   }
 
   const holidaySet = buildHolidayDateKeySet(holidayRows, ts.periodStart, ts.periodEnd);
-  for (let i = 0; i < 7; i += 1) {
-    const d = new Date(ts.periodStart);
-    d.setDate(d.getDate() + i);
-    d.setHours(12, 0, 0, 0);
-    const dow = d.getDay();
+  const weekDayKeys = [];
+  eachUtcDayKeyInRange(ts.periodStart, ts.periodEnd, (dayKey) => weekDayKeys.push(dayKey));
+
+  for (const dayKey of weekDayKeys) {
+    const d = parseCalendarDate(dayKey);
+    const dow = d.getUTCDay();
     if (dow !== 0 && dow !== 6) continue;
-    const dayKey = d.toISOString().slice(0, 10);
     if (holidaySet.has(dayKey)) continue;
 
     const existingWo = await TimesheetEntry.findOne({

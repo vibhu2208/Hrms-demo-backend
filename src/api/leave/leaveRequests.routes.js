@@ -6,6 +6,7 @@ const {
   myLeaveHistory,
   withdrawLeave,
   managerLeaveQueue,
+  managerTeamLeaveCalendar,
   managerActionLeave,
   adminLeaveOverview,
   adminEscalationInbox,
@@ -20,6 +21,7 @@ router.get('/history', myLeaveHistory);
 router.post('/', applyLeave);
 router.patch('/:id/withdraw', withdrawLeave);
 router.get('/manager/queue', managerLeaveQueue);
+router.get('/manager/team-calendar', managerTeamLeaveCalendar);
 router.patch('/:id/action', managerActionLeave);
 router.get('/admin/overview', adminLeaveOverview);
 router.get('/admin/escalations', adminEscalationInbox);

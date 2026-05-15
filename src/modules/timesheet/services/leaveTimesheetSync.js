@@ -8,7 +8,12 @@ const {
   SliceStatus,
   AttendanceStatus
 } = require('../types/timesheet.types');
-const { ensureWeekTimesheet, startOfWeek } = require('./timesheetPeriod');
+const {
+  ensureWeekTimesheet,
+  parseCalendarDate,
+  calendarDayKeyUtc,
+  eachUtcDayKeyInRange
+} = require('./timesheetPeriod');
 
 /** Hours per full paid day / holiday (env optional; must be a sane positive number). */
 const STANDARD_SHIFT = (() => {
@@ -29,50 +34,63 @@ function resolveLeaveTypeIsPaid(leaveType) {
   return true;
 }
 
-function utcNoon(y, m, d) {
-  return new Date(Date.UTC(y, m, d, 12, 0, 0, 0));
+function utcNoonFromDayKey(dayKey) {
+  const [y, m, d] = dayKey.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d, 12, 0, 0, 0));
+}
+
+function dayKeyInLeaveRange(dayKey, fromDate, toDate) {
+  const key = calendarDayKeyUtc(parseCalendarDate(dayKey));
+  const fromKey = calendarDayKeyUtc(fromDate);
+  const toKey = calendarDayKeyUtc(toDate);
+  return key >= fromKey && key <= toKey;
 }
 
 async function eachUtcCalendarDayAsync(fromDate, toDate, fn) {
-  let y = fromDate.getUTCFullYear();
-  let m = fromDate.getUTCMonth();
-  let d = fromDate.getUTCDate();
-  const endY = toDate.getUTCFullYear();
-  const endM = toDate.getUTCMonth();
-  const endD = toDate.getUTCDate();
-  for (;;) {
-    const cur = utcNoon(y, m, d);
-    const pastEnd = y > endY || (y === endY && m > endM) || (y === endY && m === endM && d > endD);
-    if (pastEnd) break;
-    await fn(cur);
-    const next = new Date(Date.UTC(y, m, d + 1));
-    y = next.getUTCFullYear();
-    m = next.getUTCMonth();
-    d = next.getUTCDate();
+  const fromKey = calendarDayKeyUtc(fromDate);
+  const toKey = calendarDayKeyUtc(toDate);
+  const keys = [];
+  eachUtcDayKeyInRange(fromKey, toKey, (k) => keys.push(k));
+  for (const dayKey of keys) {
+    await fn(utcNoonFromDayKey(dayKey), dayKey);
   }
 }
 
 /**
- * Idempotent: removes all auto rows for this request, then recreates if still approved.
+ * Idempotent: sync approved leave rows onto the correct weekly timesheet(s).
+ * @param {{ periodStart?: Date, periodEnd?: Date }} [weekBounds] When set, only touch this calendar week (used on week load).
  */
-async function syncLeaveRequestToTimesheets(connection, leaveRequestId) {
+async function syncLeaveRequestToTimesheets(connection, leaveRequestId, weekBounds = null) {
   const { LeaveRequest, LeaveType } = getLeaveModels(connection);
-  const { Timesheet, TimesheetEntry } = getTimesheetModels(connection);
+  const { TimesheetEntry } = getTimesheetModels(connection);
 
   const lr = await LeaveRequest.findById(leaveRequestId);
   if (!lr) return { ok: false, reason: 'leave_not_found' };
 
-  await TimesheetEntry.deleteMany({
-    leaveRequestId: lr._id,
-    source: TimesheetEntrySource.LEAVE_AUTOFILL
-  });
-
   if (lr.status !== LeaveRequestStatus.APPROVED) {
+    await TimesheetEntry.deleteMany({
+      leaveRequestId: lr._id,
+      source: TimesheetEntrySource.LEAVE_AUTOFILL
+    });
     return { ok: true, cleared: true };
   }
 
   const leaveType = await LeaveType.findById(lr.leaveTypeId).lean();
   if (!leaveType) return { ok: false, reason: 'leave_type_not_found' };
+
+  if (weekBounds?.periodStart && weekBounds?.periodEnd) {
+    const ts = await ensureWeekTimesheet(connection, lr.appliedFor, weekBounds.periodStart);
+    await TimesheetEntry.deleteMany({
+      timesheetId: ts._id,
+      leaveRequestId: lr._id,
+      source: TimesheetEntrySource.LEAVE_AUTOFILL
+    });
+  } else {
+    await TimesheetEntry.deleteMany({
+      leaveRequestId: lr._id,
+      source: TimesheetEntrySource.LEAVE_AUTOFILL
+    });
+  }
 
   const isPaid = resolveLeaveTypeIsPaid(leaveType);
   const halfShift = Number((STANDARD_SHIFT / 2).toFixed(2));
@@ -87,10 +105,20 @@ async function syncLeaveRequestToTimesheets(connection, leaveRequestId) {
   if (lr.reason) remarksParts.push(String(lr.reason).trim());
   const remarks = remarksParts.join(' — ').slice(0, 2000);
 
-  await eachUtcCalendarDayAsync(lr.fromDate, lr.toDate, async (entryDate) => {
-    await ensureWeekTimesheet(connection, lr.appliedFor, entryDate);
-    const ts = await Timesheet.findOne({ employeeId: lr.appliedFor, periodStart: startOfWeek(entryDate) });
-    if (!ts) return;
+  const rangeStart = weekBounds?.periodStart || lr.fromDate;
+  const rangeEnd = weekBounds?.periodEnd || lr.toDate;
+
+  await eachUtcCalendarDayAsync(rangeStart, rangeEnd, async (entryDate, dayKey) => {
+    if (!dayKeyInLeaveRange(dayKey, lr.fromDate, lr.toDate)) return;
+
+    const ts = await ensureWeekTimesheet(connection, lr.appliedFor, entryDate);
+
+    await TimesheetEntry.deleteMany({
+      timesheetId: ts._id,
+      leaveRequestId: lr._id,
+      source: TimesheetEntrySource.LEAVE_AUTOFILL,
+      entryDate
+    });
 
     await TimesheetEntry.create({
       timesheetId: ts._id,
@@ -118,7 +146,7 @@ async function syncLeaveRequestToTimesheets(connection, leaveRequestId) {
 }
 
 /**
- * Re-sync every approved leave overlapping the timesheet week (fixes edits and keeps rows current).
+ * Re-sync approved leave overlapping this timesheet week only (does not disturb other weeks).
  */
 async function syncApprovedLeavesOverlappingWeek(connection, employeeId, periodStart, periodEnd) {
   const { LeaveRequest } = getLeaveModels(connection);
@@ -130,13 +158,43 @@ async function syncApprovedLeavesOverlappingWeek(connection, employeeId, periodS
     toDate: { $gte: periodStart }
   }).distinct('_id');
 
+  const weekBounds = { periodStart, periodEnd };
   for (const id of ids) {
-    await syncLeaveRequestToTimesheets(connection, id);
+    await syncLeaveRequestToTimesheets(connection, id, weekBounds);
+  }
+}
+
+/**
+ * Remove system rows on a timesheet whose calendar day falls outside that timesheet's week.
+ */
+async function pruneEntriesOutsideTimesheetWeek(connection, timesheetId, periodStart, periodEnd) {
+  const { TimesheetEntry } = getTimesheetModels(connection);
+  const validKeys = new Set();
+  eachUtcDayKeyInRange(periodStart, periodEnd, (k) => validKeys.add(k));
+
+  const rows = await TimesheetEntry.find({
+    timesheetId,
+    source: {
+      $in: [
+        TimesheetEntrySource.LEAVE_AUTOFILL,
+        TimesheetEntrySource.HOLIDAY_AUTOFILL,
+        TimesheetEntrySource.WEEK_OFF_AUTOFILL
+      ]
+    }
+  }).select('entryDate');
+
+  const orphanIds = rows
+    .filter((r) => !validKeys.has(calendarDayKeyUtc(r.entryDate)))
+    .map((r) => r._id);
+
+  if (orphanIds.length) {
+    await TimesheetEntry.deleteMany({ _id: { $in: orphanIds } });
   }
 }
 
 module.exports = {
   syncLeaveRequestToTimesheets,
   syncApprovedLeavesOverlappingWeek,
+  pruneEntriesOutsideTimesheetWeek,
   STANDARD_SHIFT
 };

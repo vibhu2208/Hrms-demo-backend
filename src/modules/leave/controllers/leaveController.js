@@ -4,8 +4,12 @@ const {
   submitLeaveRequest,
   actionLeaveRequest,
   withdrawLeaveRequest,
-  adminOverrideLeave
+  adminOverrideLeave,
+  getTeamMemberIdsForManager,
+  filterLeaveRowsForManager,
+  enrichLeaveRowsWithApprovers
 } = require('../services/leaveService');
+const { fetchHolidaysForRangeDocs } = require('../services/holidayRangeHelper');
 const { validateLeaveTypePolicy } = require('../services/leavePolicy');
 
 function ensureTenant(req) {
@@ -32,6 +36,18 @@ function endOfDay(d) {
   const x = new Date(d);
   x.setHours(23, 59, 59, 999);
   return x;
+}
+
+function formatUserName(user) {
+  if (!user) return 'Unknown User';
+  return `${user.firstName || ''} ${user.lastName || ''}`.trim() || user.name || user.email || 'Unknown User';
+}
+
+function toObjectIds(ids) {
+  return [...ids]
+    .filter(Boolean)
+    .filter((id) => mongoose.Types.ObjectId.isValid(id))
+    .map((id) => new mongoose.Types.ObjectId(id));
 }
 
 function ymdKey(d) {
@@ -313,6 +329,16 @@ exports.managerLeaveQueue = async (req, res) => {
     if (!currentUser || !['manager', 'admin', 'company_admin'].includes(currentUser.role)) {
       return res.status(403).json({ success: false, message: 'Manager/Admin only' });
     }
+
+    const isManagerRole = currentUser.role === 'manager';
+    let teamMemberIds = [];
+    if (isManagerRole) {
+      teamMemberIds = await getTeamMemberIdsForManager(connection, req.user._id);
+    }
+
+    const todayStart = startOfDay(new Date());
+    const todayEnd = endOfDay(new Date());
+
     const v2Raw = await LeaveRequest.find({ status: 'pending' }).sort({ createdAt: 1 }).lean();
 
     // Backward compatibility with legacy leave requests collection
@@ -360,11 +386,6 @@ exports.managerLeaveQueue = async (req, res) => {
     v2LeaveTypes.forEach((lt) => leaveTypeMap.set(String(lt._id), lt.name));
     legacyLeaveTypes.forEach((lt) => leaveTypeMap.set(String(lt._id), lt.name || lt.leaveType || 'Unknown Leave Type'));
 
-    const formatUserName = (user) => {
-      if (!user) return 'Unknown User';
-      return `${user.firstName || ''} ${user.lastName || ''}`.trim() || user.name || user.email || 'Unknown User';
-    };
-
     let v2 = v2Raw.map((row) => {
       const requesterId = row.appliedFor || row.employeeId;
       const leaveTypeId = row.leaveTypeId ? String(row.leaveTypeId) : null;
@@ -411,7 +432,170 @@ exports.managerLeaveQueue = async (req, res) => {
       legacyMapped = legacyMapped.filter((row) => row.requesterRole !== 'manager');
     }
 
-    res.json({ success: true, data: [...v2, ...legacyMapped] });
+    if (isManagerRole) {
+      v2 = await enrichLeaveRowsWithApprovers(connection, v2);
+      legacyMapped = await enrichLeaveRowsWithApprovers(connection, legacyMapped);
+      v2 = await filterLeaveRowsForManager(connection, req.user._id, v2);
+      legacyMapped = await filterLeaveRowsForManager(connection, req.user._id, legacyMapped);
+    }
+
+    const { q, leaveType, fromDate, toDate } = req.query;
+    let combined = [...v2, ...legacyMapped];
+    if (q && String(q).trim()) {
+      const needle = String(q).trim().toLowerCase();
+      combined = combined.filter((row) => (row.requesterName || '').toLowerCase().includes(needle));
+    }
+    if (leaveType && String(leaveType).trim()) {
+      const lt = String(leaveType).trim().toLowerCase();
+      combined = combined.filter((row) => (row.leaveTypeName || '').toLowerCase().includes(lt));
+    }
+    if (fromDate) {
+      const fd = startOfDay(new Date(fromDate));
+      if (!Number.isNaN(fd.getTime())) {
+        combined = combined.filter((row) => new Date(row.toDate) >= fd);
+      }
+    }
+    if (toDate) {
+      const td = endOfDay(new Date(toDate));
+      if (!Number.isNaN(td.getTime())) {
+        combined = combined.filter((row) => new Date(row.fromDate) <= td);
+      }
+    }
+
+    const statsEmployeeIds = isManagerRole
+      ? [...new Set([...combined.map((r) => String(r.requesterId)).filter(Boolean), ...teamMemberIds])]
+      : [];
+    const teamObjectIds = toObjectIds(statsEmployeeIds);
+    const statsScope = isManagerRole && teamObjectIds.length ? { appliedFor: { $in: teamObjectIds } } : {};
+
+    const [approvedToday, rejectedToday, onLeaveRows] = await Promise.all([
+      LeaveRequest.countDocuments({
+        ...statsScope,
+        status: 'approved',
+        actionedAt: { $gte: todayStart, $lte: todayEnd }
+      }),
+      LeaveRequest.countDocuments({
+        ...statsScope,
+        status: 'rejected',
+        actionedAt: { $gte: todayStart, $lte: todayEnd }
+      }),
+      LeaveRequest.find({
+        ...statsScope,
+        status: 'approved',
+        fromDate: { $lte: todayEnd },
+        toDate: { $gte: todayStart }
+      })
+        .select('appliedFor')
+        .lean()
+    ]);
+
+    const onLeaveToday = new Set(onLeaveRows.map((r) => String(r.appliedFor))).size;
+
+    res.json({
+      success: true,
+      data: combined,
+      meta: {
+        pendingCount: combined.length,
+        approvedToday,
+        rejectedToday,
+        onLeaveToday,
+        teamMemberCount: isManagerRole ? teamMemberIds.length : null
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+exports.managerTeamLeaveCalendar = async (req, res) => {
+  try {
+    const connection = ensureTenant(req);
+    const { LeaveRequest, LeaveType, Holiday } = getLeaveModels(connection);
+    const User = await getUserModel(connection);
+    const currentUser = await User.findById(req.user._id).select('role');
+    if (!currentUser || !['manager', 'admin', 'company_admin'].includes(currentUser.role)) {
+      return res.status(403).json({ success: false, message: 'Manager/Admin only' });
+    }
+
+    const year = parseInt(req.query.year, 10) || new Date().getFullYear();
+    const month = parseInt(req.query.month, 10) || new Date().getMonth() + 1;
+    const rangeStart = startOfDay(new Date(year, month - 1, 1));
+    const rangeEnd = endOfDay(new Date(year, month, 0));
+
+    const isManagerRole = currentUser.role === 'manager';
+    let teamMemberIds = [];
+    if (isManagerRole) {
+      teamMemberIds = await getTeamMemberIdsForManager(connection, req.user._id);
+    }
+
+    const leaveFilter = {
+      status: { $in: ['pending', 'approved'] },
+      fromDate: { $lte: rangeEnd },
+      toDate: { $gte: rangeStart }
+    };
+
+    let leavesRaw = await LeaveRequest.find(leaveFilter).sort({ fromDate: 1 }).lean();
+    const userIds = [...new Set(leavesRaw.map((r) => String(r.appliedFor)).filter(Boolean))];
+    const users = userIds.length
+      ? await User.find({ _id: { $in: toObjectIds(userIds) } })
+          .select('_id firstName lastName name email role')
+          .lean()
+      : [];
+    const userMap = new Map(users.map((u) => [String(u._id), u]));
+
+    const leaveTypeIds = [...new Set(leavesRaw.map((r) => String(r.leaveTypeId)).filter(Boolean))];
+    const leaveTypes = leaveTypeIds.length
+      ? await LeaveType.find({ _id: { $in: toObjectIds(leaveTypeIds) } })
+          .select('_id name')
+          .lean()
+      : [];
+    const leaveTypeMap = new Map(leaveTypes.map((lt) => [String(lt._id), lt.name]));
+
+    let leavesMapped = leavesRaw
+      .filter((row) => {
+        if (!isManagerRole) return true;
+        const role = userMap.get(String(row.appliedFor))?.role;
+        return role !== 'manager';
+      })
+      .map((row) => ({
+        _id: row._id,
+        requesterId: row.appliedFor,
+        employeeId: row.appliedFor,
+        appliedFor: row.appliedFor,
+        requesterName: formatUserName(userMap.get(String(row.appliedFor))),
+        leaveTypeName: leaveTypeMap.get(String(row.leaveTypeId)) || 'Leave',
+        fromDate: row.fromDate,
+        toDate: row.toDate,
+        durationDays: row.durationDays,
+        status: row.status,
+        halfDay: row.halfDay,
+        reason: row.reason || '',
+        eligibleApproverIds: row.eligibleApproverIds || []
+      }));
+
+    if (isManagerRole) {
+      leavesMapped = await enrichLeaveRowsWithApprovers(connection, leavesMapped);
+      leavesMapped = await filterLeaveRowsForManager(connection, req.user._id, leavesMapped);
+    }
+
+    const leaves = leavesMapped;
+
+    const holidayRows = await fetchHolidaysForRangeDocs(Holiday, rangeStart, rangeEnd);
+    const holidays = holidayRows
+      .filter((h) => (h.status || 'active') === 'active')
+      .map((h) => ({
+        _id: h._id,
+        name: h.name,
+        date: h.date,
+        holidayType: h.holidayType,
+        isRecurringYearly: h.isRecurringYearly,
+        isOptional: h.isOptional
+      }));
+
+    res.json({
+      success: true,
+      data: { leaves, holidays, rangeStart, rangeEnd }
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }

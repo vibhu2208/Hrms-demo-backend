@@ -100,7 +100,9 @@ const leaveRequestSchema = new mongoose.Schema(
     actionNote: { type: String, default: null },
     escalatedToAdmin: { type: Boolean, default: false, index: true },
     escalatedAt: { type: Date, default: null },
-    escalationDeadlineAt: { type: Date, default: null }
+    escalationDeadlineAt: { type: Date, default: null },
+    /** Snapshot of managers who may approve (project + reporting manager at submit time). */
+    eligibleApproverIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }]
   },
   { timestamps: true, collection: 'leave_requests' }
 );

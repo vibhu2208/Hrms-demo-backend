@@ -18,9 +18,28 @@ async function getTenantUserModel(connection) {
   return connection.models.User || connection.model('User', schema);
 }
 
+/** Loose project model — tenant projects store assignedManagers/assignedHRs outside strict schema. */
 async function getProjectModel(connection) {
-  const schema = require('../../../models/tenant/Project');
-  return connection.models.Project || connection.model('Project', schema);
+  return (
+    connection.models.ProjectLoose ||
+    connection.model('ProjectLoose', new mongoose.Schema({}, { strict: false }), 'projects')
+  );
+}
+
+function userIdVariants(userId) {
+  const str = String(userId);
+  const variants = [userId, str];
+  if (mongoose.Types.ObjectId.isValid(str)) {
+    variants.push(new mongoose.Types.ObjectId(str));
+  }
+  return variants;
+}
+
+function activeAssignmentFilter(base = {}) {
+  return {
+    ...base,
+    $or: [{ isActive: { $ne: false } }, { isActive: { $exists: false } }]
+  };
 }
 
 async function getProjectAssignmentModel(connection) {
@@ -49,42 +68,40 @@ async function getEligibleManagers(connection, employeeId) {
   const Project = await getProjectModel(connection);
   const ProjectAssignment = await getProjectAssignmentModel(connection);
   const employeeIdStr = String(employeeId);
-
-  // 1) Project assignments are the primary source in SPC flows
-  const assignmentRows = await ProjectAssignment.find({
-    userId: { $in: [employeeId, employeeIdStr] },
-    isActive: { $ne: false }
-  }).select('projectId');
-
-  const assignedProjectIds = assignmentRows
-    .map((row) => row.projectId)
-    .filter(Boolean)
-    .map((id) => (mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null))
-    .filter(Boolean);
-
-  // 2) Keep teamMembers/projectManager fallback for mixed data
-  const fallbackProjects = await Project.find({
-    $or: [
-      { 'teamMembers.employee': employeeId },
-      { 'teamMembers.userId': { $in: [employeeId, employeeIdStr] } },
-      { projectManager: employeeId },
-      { projectManager: employeeIdStr },
-      { assignedManagers: { $in: [employeeIdStr, employeeId] } },
-      { assignedHRs: { $in: [employeeIdStr, employeeId] } }
-    ]
-  }).select('_id');
-
-  const projectIdSet = new Set([
-    ...assignedProjectIds.map((id) => String(id)),
-    ...fallbackProjects.map((p) => String(p._id))
-  ]);
-
-  const projectIds = [...projectIdSet].map((id) => new mongoose.Types.ObjectId(id));
+  const idIn = userIdVariants(employeeId);
   const managerIds = new Set();
+  const projectIdSet = new Set();
+
+  const assignmentRows = await ProjectAssignment.find(
+    activeAssignmentFilter({ userId: { $in: idIn } })
+  ).select('projectId');
+  assignmentRows.forEach((row) => {
+    if (row.projectId) projectIdSet.add(String(row.projectId));
+  });
+
+  const linkedProjects = await Project.find({
+    $or: [
+      { 'teamMembers.employee': { $in: idIn } },
+      { 'teamMembers.userId': { $in: idIn } },
+      { projectManager: { $in: idIn } },
+      { assignedHRs: { $in: idIn } },
+      { assignedManagers: { $in: idIn } }
+    ]
+  })
+    .select('_id projectManager assignedManagers')
+    .lean();
+  linkedProjects.forEach((p) => projectIdSet.add(String(p._id)));
+
+  const projectIds = [...projectIdSet]
+    .filter((id) => mongoose.Types.ObjectId.isValid(id))
+    .map((id) => new mongoose.Types.ObjectId(id));
 
   if (projectIds.length > 0) {
-    const projects = await Project.find({ _id: { $in: projectIds } }).select('_id projectManager assignedManagers');
+    const projectIdVariants = [...projectIds, ...projectIds.map((id) => String(id))];
 
+    const projects = await Project.find({ _id: { $in: projectIds } })
+      .select('projectManager assignedManagers')
+      .lean();
     projects.forEach((p) => {
       if (p.projectManager) managerIds.add(String(p.projectManager));
       if (Array.isArray(p.assignedManagers)) {
@@ -92,18 +109,19 @@ async function getEligibleManagers(connection, employeeId) {
       }
     });
 
-    const assignments = await ProjectAssignment.find({
-      projectId: { $in: [...projectIds, ...projectIds.map((id) => String(id))] },
-      role: 'manager',
-      isActive: { $ne: false }
-    }).select('userId');
-
+    const assignments = await ProjectAssignment.find(
+      activeAssignmentFilter({ projectId: { $in: projectIdVariants } })
+    ).select('userId role');
     assignments.forEach((a) => {
-      if (a.userId) managerIds.add(String(a.userId));
+      if (!a.userId) return;
+      const role = String(a.role || '').toLowerCase();
+      if (role === 'manager' || role === 'project_manager') {
+        managerIds.add(String(a.userId));
+      }
     });
   }
 
-  managerIds.delete(String(employeeId));
+  managerIds.delete(employeeIdStr);
 
   const empUser = await User.findById(employeeId).select('reportingManager').lean();
   if (empUser?.reportingManager) {
@@ -113,14 +131,145 @@ async function getEligibleManagers(connection, employeeId) {
       if (
         rmUser &&
         ['manager', 'company_admin', 'admin'].includes(rmUser.role) &&
-        String(rmUser._id) !== String(employeeId)
+        String(rmUser._id) !== employeeIdStr
       ) {
         managerIds.add(String(rmUser._id));
       }
     }
   }
 
-  return [...managerIds].map((id) => new mongoose.Types.ObjectId(id));
+  return [...managerIds]
+    .filter((id) => mongoose.Types.ObjectId.isValid(id))
+    .map((id) => new mongoose.Types.ObjectId(id));
+}
+
+/**
+ * Team members a manager may oversee — project assignments, teamMembers, reporting manager.
+ */
+async function getTeamMemberIdsForManager(connection, managerId) {
+  const User = await getTenantUserModel(connection);
+  const Project = await getProjectModel(connection);
+  const ProjectAssignment = await getProjectAssignmentModel(connection);
+  const managerIdStr = String(managerId);
+  const idIn = userIdVariants(managerId);
+  const manager = await User.findById(managerId).select('email').lean();
+  if (!manager) return [];
+
+  const memberIds = new Set();
+  const managerEmail = manager.email ? String(manager.email).trim().toLowerCase() : '';
+
+  if (managerEmail) {
+    const directReports = await User.find({
+      reportingManager: managerEmail,
+      isActive: { $ne: false }
+    })
+      .select('_id')
+      .lean();
+    directReports.forEach((u) => memberIds.add(String(u._id)));
+  }
+
+  const projectIdSet = new Set();
+
+  const managedProjects = await Project.find({
+    $or: [{ projectManager: { $in: idIn } }, { assignedManagers: { $in: idIn } }]
+  })
+    .select('_id')
+    .lean();
+  managedProjects.forEach((p) => projectIdSet.add(String(p._id)));
+
+  const myAssignments = await ProjectAssignment.find(activeAssignmentFilter({ userId: { $in: idIn } })).select(
+    'projectId role'
+  );
+  myAssignments.forEach((a) => {
+    if (a.projectId) projectIdSet.add(String(a.projectId));
+  });
+
+  const projectIds = [...projectIdSet]
+    .filter((id) => mongoose.Types.ObjectId.isValid(id))
+    .map((id) => new mongoose.Types.ObjectId(id));
+
+  if (projectIds.length) {
+    const projectIdVariants = [...projectIds, ...projectIds.map((id) => String(id))];
+    const assignments = await ProjectAssignment.find(activeAssignmentFilter({ projectId: { $in: projectIdVariants } })).select(
+      'userId'
+    );
+    assignments.forEach((a) => {
+      if (a.userId && String(a.userId) !== managerIdStr) memberIds.add(String(a.userId));
+    });
+
+    const projects = await Project.find({ _id: { $in: projectIds } })
+      .select('teamMembers assignedHRs')
+      .lean();
+    projects.forEach((p) => {
+      (p.teamMembers || []).forEach((tm) => {
+        if (tm.isActive === false) return;
+        const uid = tm.employee || tm.userId;
+        if (uid && String(uid) !== managerIdStr) memberIds.add(String(uid));
+      });
+      (p.assignedHRs || []).forEach((uid) => {
+        if (uid && String(uid) !== managerIdStr) memberIds.add(String(uid));
+      });
+    });
+  }
+
+  memberIds.delete(managerIdStr);
+  return [...memberIds];
+}
+
+/** Whether this manager is an eligible approver for the employee (same rules as leave submission). */
+async function managerCanApproveEmployeeLeave(connection, managerId, employeeId) {
+  const managerIdStr = String(managerId);
+  const employeeIdStr = String(employeeId);
+  if (!employeeIdStr || managerIdStr === employeeIdStr) return false;
+
+  const teamIds = await getTeamMemberIdsForManager(connection, managerId);
+  if (teamIds.includes(employeeIdStr)) return true;
+
+  const eligible = await getEligibleManagers(connection, employeeId);
+  return eligible.some((m) => String(m) === managerIdStr);
+}
+
+async function filterLeaveRowsForManager(connection, managerId, rows) {
+  const managerIdStr = String(managerId);
+  const cache = new Map();
+  const out = [];
+  for (const row of rows) {
+    const approvers = row.eligibleApproverIds;
+    if (Array.isArray(approvers) && approvers.length > 0) {
+      if (approvers.some((id) => String(id) === managerIdStr)) out.push(row);
+      continue;
+    }
+
+    const employeeId = String(row.requesterId || row.appliedFor || row.employeeId || '');
+    if (!employeeId) continue;
+    if (cache.has(employeeId)) {
+      if (cache.get(employeeId)) out.push(row);
+      continue;
+    }
+    const allowed = await managerCanApproveEmployeeLeave(connection, managerId, employeeId);
+    cache.set(employeeId, allowed);
+    if (allowed) out.push(row);
+  }
+  return out;
+}
+
+/** Attach eligibleApproverIds to legacy rows missing the snapshot field. */
+async function enrichLeaveRowsWithApprovers(connection, rows) {
+  const enriched = [];
+  for (const row of rows) {
+    if (Array.isArray(row.eligibleApproverIds) && row.eligibleApproverIds.length > 0) {
+      enriched.push(row);
+      continue;
+    }
+    const employeeId = row.appliedFor || row.requesterId || row.employeeId;
+    if (!employeeId) {
+      enriched.push(row);
+      continue;
+    }
+    const eligibleApproverIds = await getEligibleManagers(connection, employeeId);
+    enriched.push({ ...row, eligibleApproverIds });
+  }
+  return enriched;
 }
 
 /** True when TenantUser.reportingManager resolves to an active approver (manager / admin roles). */
@@ -257,6 +406,7 @@ async function submitLeaveRequest(connection, actor, input) {
     appliedFor: employee._id,
     reason: input.reason || '',
     attachmentUrl: input.attachmentUrl || null,
+    eligibleApproverIds: managers,
     escalatedToAdmin: false,
     escalationDeadlineAt: autoApproveNow ? null : escalationDeadlineAt,
     actionedBy: autoApproveNow ? actorId : null,
@@ -359,6 +509,12 @@ async function actionLeaveRequest(connection, actor, requestId, decision, note) 
   }
   if (!isRequesterManager && !['manager', 'admin', 'company_admin'].includes(actor.role)) {
     throw new Error('Only manager/admin can action this leave request');
+  }
+  if (actor.role === 'manager' && !isAdmin(actor.role)) {
+    const canApprove = await managerCanApproveEmployeeLeave(connection, actor._id, request.appliedFor);
+    if (!canApprove) {
+      throw new Error('You can only action leave requests for your team members');
+    }
   }
 
   const newStatus = decision === 'approve' ? LeaveRequestStatus.APPROVED : LeaveRequestStatus.REJECTED;
@@ -524,5 +680,10 @@ module.exports = {
   actionLeaveRequest,
   withdrawLeaveRequest,
   adminOverrideLeave,
-  runLeaveEscalationJob
+  runLeaveEscalationJob,
+  getTeamMemberIdsForManager,
+  getEligibleManagers,
+  managerCanApproveEmployeeLeave,
+  filterLeaveRowsForManager,
+  enrichLeaveRowsWithApprovers
 };
