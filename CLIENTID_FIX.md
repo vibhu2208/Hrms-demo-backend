@@ -1,6 +1,6 @@
 # ClientId Validation Error Fix
 
-## Issue
+## Issue.
 When company admin tried to login, got error:
 ```
 User validation failed: clientId: Path `clientId` is required.
