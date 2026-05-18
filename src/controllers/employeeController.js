@@ -196,6 +196,122 @@ exports.getEmployees = async (req, res) => {
   }
 };
 
+// @desc    Get current user's employee profile (by email)
+// @route   GET /api/employees/profile
+// @access  Private
+exports.getCurrentEmployeeProfile = async (req, res) => {
+  try {
+    const tenantConnection = req.tenant.connection;
+    const TenantEmployee = getTenantModel(tenantConnection, 'Employee', TenantEmployeeSchema);
+    const TenantDepartment = getTenantModel(tenantConnection, 'Department', Department.schema);
+    const user = req.user;
+
+    const employee = await TenantEmployee.findOne({
+      email: user.email?.toLowerCase()
+    }).lean();
+
+    if (employee) {
+      const deptId = employee.departmentId || employee.department;
+      if (deptId) {
+        try {
+          const department = await TenantDepartment.findById(deptId);
+          employee.department = department
+            ? { _id: department._id, name: department.name }
+            : (typeof employee.department === 'string'
+              ? { name: employee.department }
+              : null);
+        } catch {
+          employee.department = typeof employee.department === 'string'
+            ? { name: employee.department }
+            : null;
+        }
+      }
+
+      return res.status(200).json({
+        success: true,
+        data: {
+          ...employee,
+          id: employee._id
+        }
+      });
+    }
+
+    // HR/admin users may not have an Employee record — return tenant user profile
+    res.status(200).json({
+      success: true,
+      data: {
+        id: user._id,
+        _id: user._id,
+        firstName: user.firstName || '',
+        lastName: user.lastName || '',
+        email: user.email,
+        phone: user.phone || '',
+        role: user.role,
+        employeeCode: user.employeeCode || null,
+        designation: user.designation || user.role,
+        department: user.departmentId
+          ? { _id: user.departmentId }
+          : { name: 'General' },
+        joiningDate: user.joiningDate || user.createdAt,
+        status: user.isActive === false ? 'inactive' : 'active',
+        employmentType: user.employmentType || 'full-time'
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching current employee profile:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to fetch employee profile'
+    });
+  }
+};
+
+// @desc    Get profile stats for current user (leave, tenure)
+// @route   GET /api/employees/profile/stats
+// @access  Private
+exports.getCurrentEmployeeProfileStats = async (req, res) => {
+  try {
+    const tenantConnection = req.tenant.connection;
+    const TenantEmployee = getTenantModel(tenantConnection, 'Employee', TenantEmployeeSchema);
+    const LeaveBalanceSchema = require('../models/tenant/LeaveBalance');
+    const LeaveBalance = getTenantModel(tenantConnection, 'LeaveBalance', LeaveBalanceSchema);
+    const user = req.user;
+    const year = new Date().getFullYear();
+
+    const employee = await TenantEmployee.findOne({
+      email: user.email?.toLowerCase()
+    }).select('joiningDate').lean();
+
+    const joiningDate = employee?.joiningDate || user.joiningDate || user.createdAt;
+    const totalDays = joiningDate
+      ? Math.max(0, Math.floor((Date.now() - new Date(joiningDate).getTime()) / (1000 * 60 * 60 * 24)))
+      : 0;
+
+    const balances = await LeaveBalance.find({
+      employeeEmail: user.email?.toLowerCase(),
+      year
+    }).lean();
+
+    const leaveTaken = balances.reduce((sum, b) => sum + (b.consumed || 0), 0);
+    const leaveBalance = balances.reduce((sum, b) => sum + (b.available ?? 0), 0);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        totalDays,
+        leaveTaken,
+        leaveBalance
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching employee profile stats:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to fetch profile stats'
+    });
+  }
+};
+
 // @desc    Get single employee
 // @route   GET /api/employees/:id
 // @access  Private

@@ -3,6 +3,8 @@ const router = express.Router();
 const {
   getEmployees,
   getEmployee,
+  getCurrentEmployeeProfile,
+  getCurrentEmployeeProfileStats,
   getEmployeesForOffboarding,
   createEmployee,
   updateEmployee,
@@ -43,6 +45,9 @@ router.route('/')
   .post(authorize('admin', 'hr'), createEmployee);
 
 router.put('/:id/reset-password', authorize('admin', 'hr'), resetEmployeePassword);
+
+router.get('/profile/stats', getCurrentEmployeeProfileStats);
+router.get('/profile', getCurrentEmployeeProfile);
 
 router.route('/:id')
   .get(getEmployee)
