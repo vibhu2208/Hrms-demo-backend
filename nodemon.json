@@ -1,0 +1,15 @@
+{
+  "watch": ["src"],
+  "ext": "js,json",
+  "ignore": [
+    "uploads/**",
+    "node_modules/**",
+    "*.log",
+    ".git/**"
+  ],
+  "exec": "node ./src/app.js",
+  "delay": 4000,
+  "signal": "SIGTERM",
+  "stdout": true,
+  "legacyWatch": false
+}

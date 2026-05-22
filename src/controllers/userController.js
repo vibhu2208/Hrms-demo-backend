@@ -60,13 +60,7 @@ exports.updateThemePreference = async (req, res) => {
       });
     }
 
-    const validThemes = ['light', 'dark', 'blue', 'green', 'purple', 'orange', 'red', 'teal', 'grey', 'custom'];
-    if (!validThemes.includes(themePreference)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid theme preference'
-      });
-    }
+    const normalizedTheme = themePreference === 'light' ? 'light' : 'dark';
 
     // Get tenant connection from middleware
     const tenantConnection = req.tenant.connection;
@@ -75,7 +69,7 @@ exports.updateThemePreference = async (req, res) => {
     
     const user = await TenantUser.findByIdAndUpdate(
       req.user.id,
-      { themePreference },
+      { themePreference: normalizedTheme },
       { new: true, runValidators: true }
     ).select('themePreference email role');
 

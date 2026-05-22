@@ -28,27 +28,27 @@ const companyThemeSchema = new mongoose.Schema({
   colors: {
     primary: {
       type: String,
-      default: '#3b82f6' // blue-500
+      default: '#5C6FE0'
     },
     secondary: {
       type: String,
-      default: '#8b5cf6' // purple-500
+      default: '#5C6370'
     },
     accent: {
       type: String,
-      default: '#10b981' // green-500
+      default: '#5C6FE0'
     },
     background: {
       type: String,
-      default: '#0f172a' // dark-950
+      default: '#13141A'
     },
     text: {
       type: String,
-      default: '#f1f5f9' // gray-100
+      default: '#EDEDEF'
     },
     cardBackground: {
       type: String,
-      default: '#1e293b' // dark-900
+      default: '#1A1B22'
     }
   },
   // Typography

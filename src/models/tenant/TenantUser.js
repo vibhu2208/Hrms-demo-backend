@@ -201,7 +201,7 @@ const tenantUserSchema = new mongoose.Schema({
   // Theme preference
   themePreference: {
     type: String,
-    enum: ['light', 'dark', 'blue', 'green', 'purple', 'orange', 'red', 'teal', 'grey', 'custom'],
+    enum: ['light', 'dark'],
     default: 'dark'
   },
   // Created by

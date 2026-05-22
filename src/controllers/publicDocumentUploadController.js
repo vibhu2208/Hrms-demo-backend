@@ -16,7 +16,7 @@ const { getTenantConnection } = require('../config/database.config');
  * Generate upload token for candidate
  * Called when onboarding is created or offer is sent
  */
-exports.generateUploadToken = async (req, res) => {
+const generateUploadToken = async (req, res) => {
   try {
     const { onboardingId } = req.params;
     const tenantConnection = req.tenant.connection;

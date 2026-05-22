@@ -5,7 +5,8 @@
   "main": "src/app.js",
   "scripts": {
     "start": "node src/app.js",
-    "dev": "nodemon src/app.js",
+    "dev": "nodemon",
+    "dev:node": "node src/app.js",
     "build": "echo 'No build step required'",
     "migrate:single-company": "node src/utils/migrateSingleCompanyToMongoCluster.js"
   },
